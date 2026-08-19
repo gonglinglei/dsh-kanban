@@ -1,0 +1,16 @@
+{
+  "name": "dsh-kanban",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Project board for the DeepSeek Harness (DSH) Web GUI: manage projects through a design → human-confirm → execute relay.",
+  "scripts": {
+    "build": "pnpm --filter dsh-kanban build",
+    "typecheck": "pnpm --filter dsh-kanban typecheck",
+    "watch": "pnpm --filter dsh-kanban watch"
+  },
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "jsdom": "^25.0.1"
+  }
+}
