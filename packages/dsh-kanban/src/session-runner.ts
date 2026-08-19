@@ -116,6 +116,19 @@ export function resumePrompt(project: Project): string {
   ].join('\n')
 }
 
+/** The execution-resume prompt: the host restarted mid-run, continue in this session. */
+export function executeResumePrompt(project: Project): string {
+  return [
+    '你是 dsh-kanban 的执行 agent。宿主已重启，你的任务尚未完成，请继续。',
+    '',
+    `项目：${project.title}`,
+    `工作目录：${project.workspaceDir}`,
+    `方案文件：${project.planPath ?? join(project.workspaceDir, 'plan.md')}`,
+    '',
+    '请检查当前进度，继续按方案执行，全部完成后结束你的回合。',
+  ].join('\n')
+}
+
 export class KanbanSessionRunner {
   constructor(private readonly api: KanbanApi) {}
 
@@ -131,13 +144,23 @@ export class KanbanSessionRunner {
 
   /** Prompt the project's existing design session with the rejection feedback. */
   async resumeDesign(project: Project): Promise<string> {
+    return this.resume(project, resumePrompt(project))
+  }
+
+  /** Prompt the project's existing execution session to continue after a host restart. */
+  async resumeExecute(project: Project): Promise<string> {
+    return this.resume(project, executeResumePrompt(project))
+  }
+
+  /** Prompt the project's attached session with the given text; returns the session id. */
+  private async resume(project: Project, text: string): Promise<string> {
     if (project.sessionId === undefined) throw new Error('resume requested but no session is attached')
     const sessionId = project.sessionId
     try {
       const prompted = await this.api.sessions.prompt(request({
         sessionId,
         mode: 'queue',
-        content: [{ type: 'text', text: resumePrompt(project) }],
+        content: [{ type: 'text', text }],
       }))
       if (!prompted.result.ok) throw failure(prompted.result.error)
     } catch (error) {

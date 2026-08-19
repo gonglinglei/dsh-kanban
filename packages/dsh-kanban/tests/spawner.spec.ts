@@ -153,4 +153,47 @@ describe('KanbanSpawner', () => {
     await flush(1)
     expect(api.sessions.prompted.at(-1)?.sessionId).toBe('sess-old')
   })
+
+  it('recovers an executing phase by resuming the attached execute session, never re-spawning', async () => {
+    const service = makeService()
+    // Crash during execution: the execute session was attached, the run was
+    // not finished, and the host restarted.
+    const project = service.createProject({ title: 't', workspaceDir: dir, goal: 'g' })
+    service.attachSession(project.id, 'sess-exec', 'execute')
+    service.transition(project.id, 'executing')
+
+    const api = new FakeApi()
+    const spawner = new KanbanSpawner(service, api)
+    spawner.start()
+    await flush(1)
+    // No new session may be created: the run continues in its own session.
+    expect(api.sessions.created).toHaveLength(0)
+    expect(api.sessions.prompted.at(-1)?.sessionId).toBe('sess-exec')
+    expect(api.sessions.prompted.at(-1)?.text).toContain('继续')
+  })
+
+  it('a recovered execution ignores pre-restart turn/end events; only the resumed run settles it', async () => {
+    const service = makeService()
+    const project = service.createProject({ title: 't', workspaceDir: dir, goal: 'g' })
+    service.attachSession(project.id, 'sess-exec', 'execute')
+    service.transition(project.id, 'executing')
+
+    const api = new FakeApi()
+    // The session already has a turn/end from BEFORE the restart (a minute
+    // earlier than the recovery moment).
+    api.sessions.summaries.set('sess-exec', { sessionId: 'sess-exec', running: false })
+    api.sessions.histories.set('sess-exec', [turnEnd(Date.now() - 60_000)])
+
+    const spawner = new KanbanSpawner(service, api)
+    spawner.start()
+    await flush()
+    // The stale turn/end must not complete the phase.
+    expect(service.getProject(project.id)?.status).toBe('executing')
+
+    // The resumed run ends: a fresh turn/end after the resume settles it.
+    api.sessions.histories.set('sess-exec', [turnEnd(Date.now() - 60_000), turnEnd(Date.now() + 1)])
+    api.sessions.summaries.set('sess-exec', { sessionId: 'sess-exec', running: false })
+    await flush()
+    expect(service.getProject(project.id)?.status).toBe('done')
+  })
 })

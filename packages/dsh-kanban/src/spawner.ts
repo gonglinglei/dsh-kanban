@@ -83,10 +83,14 @@ export class KanbanSpawner {
   }
 
   private async enterExecuting(project: Project): Promise<void> {
-    const result = await this.runPhase(project, async () => ({
-      kind: 'launched' as const,
-      sessionId: await this.runner.launchExecute(project),
-    }))
+    const result = await this.runPhase(project, async () => {
+      // Host-restart recovery: a run that was already attached to a session
+      // continues in that session; only a phase with no session spawns fresh.
+      if (project.sessionId !== undefined && project.sessionRole === 'execute') {
+        return { kind: 'resumed', sessionId: await this.runner.resumeExecute(project) }
+      }
+      return { kind: 'launched', sessionId: await this.runner.launchExecute(project) }
+    })
     if (result.kind === 'failed') {
       this.fail(project, `execution phase: ${result.error}`)
       return
