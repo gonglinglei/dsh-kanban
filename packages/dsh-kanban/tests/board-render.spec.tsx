@@ -8,7 +8,7 @@
 import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Project } from '../src/protocol.ts'
+import type { Project, TaskNode } from '../src/protocol.ts'
 import { Board } from '../src/client/board.tsx'
 import { BoardStore } from '../src/client/store.ts'
 import { isBoardOpen, toggleBoard } from '../src/client/view-state.ts'
@@ -25,6 +25,23 @@ beforeEach(() => {
 afterEach(() => {
   document.body.innerHTML = ''
 })
+
+function task(overrides: Partial<TaskNode> = {}): TaskNode {
+  return {
+    id: 't1',
+    projectId: 'p1',
+    titlePath: '明确需求 > 确认数据来源',
+    kind: 'clarify',
+    status: 'awaiting-clarification',
+    question: '数据源是什么？',
+    version: 1,
+    createdAt: 0,
+    updatedAt: 0,
+    lastActivityAt: 0,
+    history: [],
+    ...overrides,
+  }
+}
 
 function project(overrides: Partial<Project> = {}): Project {
   return {
@@ -73,6 +90,7 @@ describe('Board rendering', () => {
         project({ id: 'b', status: 'done', title: '已完成的项目' }),
         project({ id: 'c', status: 'executing', title: '执行中的项目' }),
       ],
+      tasks: [],
     }
     const store = new BoardStore(transport)
     await store.refresh()
@@ -96,6 +114,7 @@ describe('Board rendering', () => {
         project({ id: 'a', status: 'awaiting-review' }),
         project({ id: 'b', status: 'done' }),
       ],
+      tasks: [],
     }
     const store = new BoardStore(transport)
     await store.refresh()
@@ -110,7 +129,7 @@ describe('Board rendering', () => {
 
   it('confirm-click forwards the confirm-plan action to the store', async () => {
     const transport = new FakeTransport()
-    transport.stateValue = { revision: 1, projects: [project({ id: 'a' })] }
+    transport.stateValue = { revision: 1, projects: [project({ id: 'a' })], tasks: [] }
     const store = new BoardStore(transport)
     await store.refresh()
     await renderBoard(store)
@@ -123,7 +142,7 @@ describe('Board rendering', () => {
 
   it('opens the new-project modal and submits create-project with the form values', async () => {
     const transport = new FakeTransport()
-    transport.stateValue = { revision: 1, projects: [] }
+    transport.stateValue = { revision: 1, projects: [], tasks: [] }
     const store = new BoardStore(transport)
     await store.refresh()
     await renderBoard(store, vi.fn(), () => '/default/dir')
@@ -156,7 +175,7 @@ describe('Board rendering', () => {
 
   it('submitting an incomplete form shows visible validation feedback and forwards nothing', async () => {
     const transport = new FakeTransport()
-    transport.stateValue = { revision: 1, projects: [] }
+    transport.stateValue = { revision: 1, projects: [], tasks: [] }
     const store = new BoardStore(transport)
     await store.refresh()
     // The workspace default is empty: exactly the real-GUI case where the
@@ -183,7 +202,7 @@ describe('Board rendering', () => {
 
   it('a failing session open shows a visible error on the card instead of staying silent', async () => {
     const transport = new FakeTransport()
-    transport.stateValue = { revision: 1, projects: [project({ id: 'a', status: 'done' })] }
+    transport.stateValue = { revision: 1, projects: [project({ id: 'a', status: 'done' })], tasks: [] }
     const store = new BoardStore(transport)
     await store.refresh()
     // The real runtime throws when the session is not in the current
@@ -202,7 +221,7 @@ describe('Board rendering', () => {
 
   it('a successful session open calls through and closes the board (the opened session must become visible)', async () => {
     const transport = new FakeTransport()
-    transport.stateValue = { revision: 1, projects: [project({ id: 'a', status: 'done' })] }
+    transport.stateValue = { revision: 1, projects: [project({ id: 'a', status: 'done' })], tasks: [] }
     const store = new BoardStore(transport)
     await store.refresh()
     const openSession = vi.fn()
@@ -219,9 +238,85 @@ describe('Board rendering', () => {
     expect(document.documentElement.hasAttribute('data-dsh-kanban-active')).toBe(false)
   })
 
+  it('renders task leaves in their columns with kind badges and paths', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = {
+      revision: 1,
+      projects: [project({ id: 'p1', status: 'executing' })],
+      tasks: [
+        task({ id: 't1', titlePath: '明确需求 > 确认数据来源', kind: 'clarify', status: 'awaiting-clarification', question: '数据源是什么？' }),
+        task({ id: 't2', titlePath: '后端 > API 实现', kind: 'execute', status: 'executing', sessionId: 'session-x' }),
+      ],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    const unmount = await renderBoard(store)
+
+    const text = container.textContent ?? ''
+    expect(text).toContain('待澄清')
+    expect(text).toContain('确认数据来源')
+    expect(text).toContain('明确需求')
+    expect(text).toContain('数据源是什么？')
+    expect(text).toContain('API 实现')
+    expect(text).toContain('澄清')
+    expect(text).toContain('执行')
+    unmount()
+  })
+
+  it('answering a clarify leaf forwards answer-clarification', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = {
+      revision: 1,
+      projects: [project({ id: 'p1', status: 'executing' })],
+      tasks: [task({ id: 't1', status: 'awaiting-clarification' })],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    await renderBoard(store)
+
+    const textarea = container.querySelector<HTMLTextAreaElement>('textarea')
+    expect(textarea).toBeDefined()
+    await act(async () => {
+      typeInto(textarea!, '本地 CSV 文件')
+    })
+    const submit = [...container.querySelectorAll('button')].find(button => button.textContent === '提交回答')
+    expect(submit).toBeDefined()
+    await act(async () => { submit!.click() })
+    expect(transport.actions).toEqual([{ kind: 'answer-clarification', projectId: 'p1', taskId: 't1', answer: '本地 CSV 文件' }])
+  })
+
+  it('a confirmed clarify leaf offers to confirm the answer; a confirmed design leaf offers to confirm the design', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = {
+      revision: 1,
+      projects: [project({ id: 'p1', status: 'executing' })],
+      tasks: [
+        task({ id: 't1', status: 'awaiting-review', answer: '一百万以内' }),
+        task({ id: 't2', titlePath: '架构设计', kind: 'design', status: 'awaiting-review' }),
+      ],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    await renderBoard(store)
+
+    const text = container.textContent ?? ''
+    expect(text).toContain('一百万以内')
+
+    const confirmAnswer = [...container.querySelectorAll('button')].find(button => button.textContent === '确认回答')
+    await act(async () => { confirmAnswer!.click() })
+    expect(transport.actions).toEqual([{ kind: 'confirm-task', projectId: 'p1', taskId: 't1' }])
+
+    const confirmDesign = [...container.querySelectorAll('button')].find(button => button.textContent === '确认设计')
+    await act(async () => { confirmDesign!.click() })
+    expect(transport.actions).toEqual([
+      { kind: 'confirm-task', projectId: 'p1', taskId: 't1' },
+      { kind: 'confirm-task', projectId: 'p1', taskId: 't2' },
+    ])
+  })
+
   it('rejects with feedback through the inline form', async () => {
     const transport = new FakeTransport()
-    transport.stateValue = { revision: 1, projects: [project({ id: 'a' })] }
+    transport.stateValue = { revision: 1, projects: [project({ id: 'a' })], tasks: [] }
     const store = new BoardStore(transport)
     await store.refresh()
     await renderBoard(store)

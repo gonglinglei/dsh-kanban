@@ -5,18 +5,27 @@
  * useSyncExternalStore; every mutation goes through store.apply.
  */
 import { useSyncExternalStore, useState } from 'react'
-import type { Project, ProjectStatus } from '../protocol.ts'
+import type { Project, ProjectStatus, TaskKind, TaskNode } from '../protocol.ts'
 import type { BoardStore } from './store.ts'
 import { closeBoard } from './view-state.ts'
 
 const COLUMNS: ReadonlyArray<{ status: ProjectStatus; label: string }> = [
   { status: 'backlog', label: '待开始' },
   { status: 'designing', label: '设计中' },
+  { status: 'awaiting-clarification', label: '待澄清' },
   { status: 'awaiting-review', label: '待确认' },
   { status: 'executing', label: '执行中' },
   { status: 'blocked', label: '阻塞' },
   { status: 'done', label: '已完成' },
 ]
+
+/** Chinese labels for the four task kinds. */
+const KIND_LABELS: Record<TaskKind, string> = {
+  clarify: '澄清',
+  research: '调研',
+  design: '设计',
+  execute: '执行',
+}
 
 export interface BoardProps {
   store: BoardStore
@@ -45,19 +54,30 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
       <div className="dk-columns">
         {COLUMNS.map(column => {
           const projects = snapshot.projects.filter(project => project.status === column.status)
+          const tasks = snapshot.tasks.filter(task => task.status === column.status)
           return (
             <section className="dk-column" key={column.status}>
               <div className="dk-column-title">
                 <span>{column.label}</span>
-                <span className="dk-column-count">{projects.length}</span>
+                <span className="dk-column-count">{projects.length + tasks.length}</span>
               </div>
-              {projects.length === 0 && <span className="dk-empty">空</span>}
+              {projects.length === 0 && tasks.length === 0 && <span className="dk-empty">空</span>}
               {projects.map(project => (
                 <ProjectCard
                   key={project.id}
                   project={project}
+                  taskCount={snapshot.tasks.filter(task => task.projectId === project.id).length}
                   rejecting={rejectingId === project.id}
                   onToggleReject={() => { setRejectingId(rejectingId === project.id ? null : project.id) }}
+                  onAction={action => { void store.apply(action) }}
+                  onOpenSession={openSession}
+                />
+              ))}
+              {tasks.map(task => (
+                <TaskCard
+                  key={task.id}
+                  task={task}
+                  projectTitle={snapshot.projects.find(project => project.id === task.projectId)?.title ?? ''}
                   onAction={action => { void store.apply(action) }}
                   onOpenSession={openSession}
                 />
@@ -82,13 +102,14 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
 
 interface ProjectCardProps {
   project: Project
+  taskCount: number
   rejecting: boolean
   onToggleReject(): void
   onAction(action: Parameters<BoardStore['apply']>[0]): void
   onOpenSession(sessionId: string): void
 }
 
-function ProjectCard({ project, rejecting, onToggleReject, onAction, onOpenSession }: ProjectCardProps): JSX.Element {
+function ProjectCard({ project, taskCount, rejecting, onToggleReject, onAction, onOpenSession }: ProjectCardProps): JSX.Element {
   const [openError, setOpenError] = useState<string | null>(null)
   const handleOpenSession = (): void => {
     setOpenError(null)
@@ -114,6 +135,7 @@ function ProjectCard({ project, rejecting, onToggleReject, onAction, onOpenSessi
       <p className="dk-card-goal">{project.goal}</p>
       <div className="dk-card-meta">
         {project.sessionId?.slice(0, 13) ?? '无会话'}
+        {taskCount > 0 && <> · 子任务 {taskCount}</>}
         {project.feedback !== undefined && <> · 反馈：{project.feedback}</>}
       </div>
       {openError !== null && <p className="dk-card-error">无法打开会话：{openError}</p>}
@@ -139,6 +161,78 @@ function ProjectCard({ project, rejecting, onToggleReject, onAction, onOpenSessi
           onSubmit={feedback => { onAction({ kind: 'reject-plan', projectId: project.id, feedback }) }}
         />
       )}
+    </article>
+  )
+}
+
+interface TaskCardProps {
+  task: TaskNode
+  projectTitle: string
+  onAction(action: Parameters<BoardStore['apply']>[0]): void
+  onOpenSession(sessionId: string): void
+}
+
+/** One decomposed task leaf: level-indented title, kind badge, and kind-specific actions. */
+function TaskCard({ task, projectTitle, onAction, onOpenSession }: TaskCardProps): JSX.Element {
+  const segments = task.titlePath.split(' > ')
+  const level = segments.length - 1
+  const [answerDraft, setAnswerDraft] = useState('')
+  const [openError, setOpenError] = useState<string | null>(null)
+  const handleOpenSession = (): void => {
+    setOpenError(null)
+    try {
+      onOpenSession(task.sessionId!)
+    } catch (error) {
+      setOpenError(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  return (
+    <article className="dk-card" style={{ marginLeft: `${Math.min(level, 3) * 14}px` }}>
+      <h3 className="dk-card-title">{segments.at(-1)}</h3>
+      {segments.length > 1 && <p className="dk-card-path">{segments.slice(0, -1).join(' > ')}</p>}
+      <div className="dk-card-meta">
+        <span className="dk-kind-badge">{KIND_LABELS[task.kind]}</span>
+        {projectTitle !== '' && <> · {projectTitle}</>}
+        {task.sessionId !== undefined && <> · {task.sessionId.slice(0, 13)}</>}
+      </div>
+      {task.kind === 'clarify' && task.status === 'awaiting-clarification' && task.question !== undefined && (
+        <div className="dk-reject">
+          <p className="dk-card-goal">❓ {task.question}</p>
+          <textarea
+            placeholder="回答这个问题（会作为后续执行任务的上下文）"
+            value={answerDraft}
+            onChange={event => { setAnswerDraft(event.target.value) }}
+          />
+          <div className="dk-card-actions">
+            <button
+              className="dk-btn dk-btn-primary"
+              disabled={answerDraft.trim() === ''}
+              onClick={() => {
+                onAction({ kind: 'answer-clarification', projectId: task.projectId, taskId: task.id, answer: answerDraft.trim() })
+                setAnswerDraft('')
+              }}
+            >提交回答</button>
+          </div>
+        </div>
+      )}
+      {task.kind === 'clarify' && task.status === 'awaiting-review' && task.answer !== undefined && (
+        <div className="dk-card-actions">
+          <span className="dk-card-goal">✅ {task.answer}</span>
+          <button className="dk-btn dk-btn-primary" onClick={() => { onAction({ kind: 'confirm-task', projectId: task.projectId, taskId: task.id }) }}>确认回答</button>
+        </div>
+      )}
+      {task.kind === 'design' && task.status === 'awaiting-review' && (
+        <div className="dk-card-actions">
+          <button className="dk-btn dk-btn-primary" onClick={() => { onAction({ kind: 'confirm-task', projectId: task.projectId, taskId: task.id }) }}>确认设计</button>
+        </div>
+      )}
+      <div className="dk-card-actions">
+        {task.sessionId !== undefined && (task.status === 'designing' || task.status === 'executing' || task.status === 'done') && (
+          <button className="dk-btn dk-btn-ghost" onClick={handleOpenSession}>打开会话</button>
+        )}
+      </div>
+      {openError !== null && <p className="dk-card-error">无法打开会话：{openError}</p>}
     </article>
   )
 }

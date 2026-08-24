@@ -6,7 +6,7 @@ import type { KanbanAction, KanbanEventPayload, KanbanSnapshot } from '../src/pr
 import type { KanbanHostTransport } from '../src/client/host-api.ts'
 
 export class FakeTransport implements KanbanHostTransport {
-  stateValue: KanbanSnapshot = { revision: 0, projects: [] }
+  stateValue: KanbanSnapshot = { revision: 0, projects: [], tasks: [] }
   actions: KanbanAction[] = []
   failState = false
   failAction = false

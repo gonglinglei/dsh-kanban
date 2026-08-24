@@ -54,6 +54,11 @@ html[data-dsh-kanban-active] [class*='centerCol'] > :not([data-dsh-kanban-view])
   word-break: break-all; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
 }
 [data-dsh-kanban-view] .dk-card-meta { font-size: 11px; color: var(--dsw-alias-text-tertiary, #999); }
+[data-dsh-kanban-view] .dk-card-path { margin: 0; font-size: 11px; color: var(--dsw-alias-text-tertiary, #999); }
+[data-dsh-kanban-view] .dk-kind-badge {
+  font-size: 10px; padding: 1px 6px; border-radius: 999px;
+  border: 1px solid var(--dsw-alias-border, #d0d0d0); color: var(--dsw-alias-text-secondary, #666);
+}
 [data-dsh-kanban-view] .dk-card-error { margin: 0; font-size: 12px; color: #b3261e; }
 [data-dsh-kanban-view] .dk-card-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 [data-dsh-kanban-view] .dk-btn {
