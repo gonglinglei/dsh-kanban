@@ -8,7 +8,7 @@ import type { KanbanAction, KanbanSnapshot } from '../protocol.ts'
 import type { KanbanHostTransport } from './host-api.ts'
 
 export class BoardStore {
-  private snapshot: KanbanSnapshot = { revision: 0, projects: [] }
+  private snapshot: KanbanSnapshot = { revision: 0, projects: [], tasks: [] }
   private lastError: string | null = null
   private readonly listeners = new Set<() => void>()
 

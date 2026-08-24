@@ -9,7 +9,7 @@
  */
 import { existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
-import type { Project } from './protocol.ts'
+import type { Project, TaskNode } from './protocol.ts'
 
 /** One RPC request (rpcId echoes back in the response). */
 export interface KanbanRpcRequest<T> {
@@ -76,7 +76,7 @@ function isErrorTurnEnd(data: unknown): boolean {
   return typeof reason === 'object' && reason !== null && (reason as { kind?: unknown }).kind === 'error'
 }
 
-/** The design agent's task prompt: produce the plan, then stop. */
+/** The design agent's task prompt: produce the plan (and optionally the decomposition), then stop. */
 export function designPrompt(project: Project): string {
   return [
     '你是 dsh-kanban 的设计 agent。请为以下项目目标产出一份可执行的方案。',
@@ -88,7 +88,19 @@ export function designPrompt(project: Project): string {
     '要求：',
     `1. 把方案写入 ${join(project.workspaceDir, 'plan.md')}（Markdown）。`,
     '2. 方案必须包含：目标拆解、执行步骤、验收标准。',
-    '3. 写完方案后结束你的回合，不要继续做其他事。',
+    '3. 判断任务本身是否已经具体到可直接执行。如果不可直接执行，额外把拆解清单写入',
+    `   ${join(project.workspaceDir, 'tasks.json')}，格式如下：`,
+    '   { "decomposed": true, "tasks": [',
+    '     { "title": "子任务标题", "kind": "clarify", "question": "需要创建人明确的问题" },',
+    '     { "title": "子任务标题", "kind": "research" },',
+    '     { "title": "子任务标题", "kind": "design", "subtasks": [ ... ] },',
+    '     { "title": "子任务标题", "kind": "execute" }',
+    '   ] }',
+    '   kind 取值：clarify=需与创建人明确目标/输入（必须带 question）；research=需提前调研；',
+    '   design=复杂设计的一部分（可嵌套 subtasks 继续拆解）；execute=任务的具体执行。',
+    '   拆解可以嵌套任意深度，只有最底层（没有 subtasks）的任务会被执行。',
+    '4. 如果任务可直接执行，不要写 tasks.json。',
+    '5. 全部完成后结束你的回合，不要继续做其他事。',
   ].join('\n')
 }
 
@@ -129,6 +141,55 @@ export function executeResumePrompt(project: Project): string {
   ].join('\n')
 }
 
+/** The artifact file of a research/design leaf. */
+export function taskArtifactPath(workspaceDir: string, taskId: string): string {
+  return join(workspaceDir, '.kanban', 'artifacts', `${taskId}.md`)
+}
+
+/** The research leaf prompt: investigate the question, write the report, stop. */
+export function researchTaskPrompt(task: TaskNode, project: Project): string {
+  return [
+    '你是 dsh-kanban 的调研 agent。请针对以下调研子任务做前期调研。',
+    '',
+    `子任务：${task.titlePath}`,
+    `所属项目：${project.title}（目标：${project.goal}）`,
+    `项目方案：${project.planPath ?? join(project.workspaceDir, 'plan.md')}`,
+    '',
+    `要求：把调研结论写入 ${taskArtifactPath(project.workspaceDir, task.id)}（Markdown），写完结束你的回合。`,
+  ].join('\n')
+}
+
+/** The design-part leaf prompt: produce this part of the design, stop. */
+export function designTaskPrompt(task: TaskNode, project: Project): string {
+  return [
+    '你是 dsh-kanban 的设计 agent。请完成以下设计子任务（它是项目复杂设计的一部分）。',
+    '',
+    `子任务：${task.titlePath}`,
+    `所属项目：${project.title}（目标：${project.goal}）`,
+    `项目方案：${project.planPath ?? join(project.workspaceDir, 'plan.md')}`,
+    '',
+    `要求：把该部分设计写入 ${taskArtifactPath(project.workspaceDir, task.id)}（Markdown），写完结束你的回合。`,
+  ].join('\n')
+}
+
+/** The execute leaf prompt: run this leaf with the plan and clarification context. */
+export function executeTaskPrompt(task: TaskNode, project: Project, clarifications: ReadonlyArray<{ question: string; answer: string }>): string {
+  const lines = [
+    '你是 dsh-kanban 的执行 agent。请执行以下子任务。',
+    '',
+    `子任务：${task.titlePath}`,
+    `所属项目：${project.title}`,
+    `工作目录：${project.workspaceDir}`,
+    `项目方案：${project.planPath ?? join(project.workspaceDir, 'plan.md')}`,
+  ]
+  if (clarifications.length > 0) {
+    lines.push('', '已确认的目标澄清记录：')
+    for (const item of clarifications) lines.push(`- 问：${item.question}；答：${item.answer}`)
+  }
+  lines.push('', '要求：按方案执行该子任务，全部完成后结束你的回合。')
+  return lines.join('\n')
+}
+
 export class KanbanSessionRunner {
   constructor(private readonly api: KanbanApi) {}
 
@@ -140,6 +201,21 @@ export class KanbanSessionRunner {
   /** Create + rename + prompt a fresh execution session; returns the session id. */
   async launchExecute(project: Project): Promise<string> {
     return this.launch(project, executePrompt(project), `${project.title}·执行`)
+  }
+
+  /** Create + rename + prompt a research leaf session; returns the session id. */
+  async launchResearch(task: TaskNode, project: Project): Promise<string> {
+    return this.launch(project, researchTaskPrompt(task, project), `${task.titlePath.split(' > ').at(-1)}·调研`)
+  }
+
+  /** Create + rename + prompt a design-part leaf session; returns the session id. */
+  async launchDesignTask(task: TaskNode, project: Project): Promise<string> {
+    return this.launch(project, designTaskPrompt(task, project), `${task.titlePath.split(' > ').at(-1)}·设计`)
+  }
+
+  /** Create + rename + prompt an execute leaf session; returns the session id. */
+  async launchExecuteTask(task: TaskNode, project: Project, clarifications: ReadonlyArray<{ question: string; answer: string }>): Promise<string> {
+    return this.launch(project, executeTaskPrompt(task, project, clarifications), `${task.titlePath.split(' > ').at(-1)}·执行`)
   }
 
   /** Prompt the project's existing design session with the rejection feedback. */
@@ -155,7 +231,11 @@ export class KanbanSessionRunner {
   /** Prompt the project's attached session with the given text; returns the session id. */
   private async resume(project: Project, text: string): Promise<string> {
     if (project.sessionId === undefined) throw new Error('resume requested but no session is attached')
-    const sessionId = project.sessionId
+    return this.resumeTaskSession(project.sessionId, text)
+  }
+
+  /** Prompt an already-attached session (project or task leaf) with the given text. */
+  async resumeTaskSession(sessionId: string, text: string): Promise<string> {
     try {
       const prompted = await this.api.sessions.prompt(request({
         sessionId,

@@ -3,18 +3,20 @@
  * hooks and reconciles running sessions with the board (the dsh-web-ui
  * task-board host-service poll pattern, Apache-2.0).
  *
- * - onEnterDesigning: resume the attached design session (rejection loop) or
- *   spawn a fresh one (create / blocked-recovery).
- * - onEnterExecuting: spawn a fresh execution session.
+ * - Projects: onEnterDesigning resumes/spawns the design session,
+ *   onEnterExecuting spawns the execution session.
+ * - Task leaves: research/design leaves spawn their own session on entering
+ *   designing; execute leaves spawn theirs on entering executing. Clarify
+ *   leaves have no session (the creator answers on the board).
  * - A 5-second poll reconciles every active phase: turn/end → phase report;
- *   failure/cancellation → blocked; missing plan.md → blocked.
+ *   failure/cancellation → blocked; missing plan.md / artifact → blocked.
  * - On start, phases that survived a host restart are re-fired (re-prompt),
  *   so a crash mid-phase does not strand a project.
  */
+import { existsSync } from 'node:fs'
 import type { KanbanHostService } from './host-service.ts'
-import { join } from 'node:path'
-import type { Project } from './protocol.ts'
-import { KanbanSessionRunner, type KanbanApi } from './session-runner.ts'
+import type { Project, TaskNode } from './protocol.ts'
+import { KanbanSessionRunner, taskArtifactPath, type KanbanApi, type KanbanSessionSummary } from './session-runner.ts'
 
 const SESSION_POLL_MS = 5_000
 
@@ -53,10 +55,19 @@ export class KanbanSpawner {
       onEnterExecuting: project => {
         void this.enterExecuting(project)
       },
+      onEnterTaskDesigning: task => {
+        void this.enterTaskDesigning(task)
+      },
+      onEnterTaskExecuting: task => {
+        void this.enterTaskExecuting(task)
+      },
     })
     // Host-restart recovery: phases that survived the crash get re-fired.
     for (const project of this.service.snapshot().projects) {
       this.service.refirePhaseHooks(project.id)
+      for (const task of this.service.projectTasks(project.id)) {
+        this.service.refireTaskPhaseHooks(task.id)
+      }
     }
     this.timer = setInterval(() => this.schedulePoll(), this.pollIntervalMs)
     return () => {
@@ -68,14 +79,14 @@ export class KanbanSpawner {
   }
 
   private async enterDesigning(project: Project): Promise<void> {
-    const result = await this.runPhase(project, async () => {
+    const result = await this.runPhase(async () => {
       if (project.sessionId !== undefined && project.sessionRole === 'design') {
         return { kind: 'resumed', sessionId: await this.runner.resumeDesign(project) }
       }
       return { kind: 'launched', sessionId: await this.runner.launchDesign(project) }
     })
     if (result.kind === 'failed') {
-      this.fail(project, `design phase: ${result.error}`)
+      this.failProject(project, `design phase: ${result.error}`)
       return
     }
     this.launchedAt.set(result.sessionId, Date.now())
@@ -83,7 +94,7 @@ export class KanbanSpawner {
   }
 
   private async enterExecuting(project: Project): Promise<void> {
-    const result = await this.runPhase(project, async () => {
+    const result = await this.runPhase(async () => {
       // Host-restart recovery: a run that was already attached to a session
       // continues in that session; only a phase with no session spawns fresh.
       if (project.sessionId !== undefined && project.sessionRole === 'execute') {
@@ -92,14 +103,74 @@ export class KanbanSpawner {
       return { kind: 'launched', sessionId: await this.runner.launchExecute(project) }
     })
     if (result.kind === 'failed') {
-      this.fail(project, `execution phase: ${result.error}`)
+      this.failProject(project, `execution phase: ${result.error}`)
       return
     }
     this.launchedAt.set(result.sessionId, Date.now())
     if (result.kind === 'launched') this.service.attachSession(project.id, result.sessionId, 'execute')
   }
 
-  private async runPhase(project: Project, launch: () => Promise<{ kind: 'launched'; sessionId: string } | { kind: 'resumed'; sessionId: string }>): Promise<SpawnResult> {
+  private async enterTaskDesigning(task: TaskNode): Promise<void> {
+    const project = this.service.getProject(task.projectId)
+    if (project === undefined) return
+    const result = await this.runPhase(async () => {
+      // Host-restart recovery: the leaf's own session resumes.
+      if (task.sessionId !== undefined && task.sessionRole === task.kind) {
+        return { kind: 'resumed', sessionId: await this.resumeTask(task, project) }
+      }
+      if (task.kind === 'research') {
+        return { kind: 'launched', sessionId: await this.runner.launchResearch(task, project) }
+      }
+      return { kind: 'launched', sessionId: await this.runner.launchDesignTask(task, project) }
+    })
+    if (result.kind === 'failed') {
+      this.failTask(task, `${task.kind} phase: ${result.error}`)
+      return
+    }
+    this.launchedAt.set(result.sessionId, Date.now())
+    if (result.kind === 'launched') this.service.attachTaskSession(task.id, result.sessionId, task.kind === 'research' ? 'research' : 'design')
+  }
+
+  private async enterTaskExecuting(task: TaskNode): Promise<void> {
+    const project = this.service.getProject(task.projectId)
+    if (project === undefined) return
+    // Execute leaves depend on the creator's clarifications: defer the spawn
+    // until every clarify leaf of the project is confirmed. The poll loop
+    // re-enters this hook once the dependency clears.
+    const pendingClarify = this.service.projectTasks(task.projectId)
+      .some(leaf => leaf.kind === 'clarify' && leaf.status !== 'done')
+    if (pendingClarify) return
+    const result = await this.runPhase(async () => {
+      if (task.sessionId !== undefined && task.sessionRole === 'execute') {
+        return { kind: 'resumed', sessionId: await this.resumeTask(task, project) }
+      }
+      return { kind: 'launched', sessionId: await this.runner.launchExecuteTask(task, project, this.clarifications(task.projectId)) }
+    })
+    if (result.kind === 'failed') {
+      this.failTask(task, `execution phase: ${result.error}`)
+      return
+    }
+    this.launchedAt.set(result.sessionId, Date.now())
+    if (result.kind === 'launched') this.service.attachTaskSession(task.id, result.sessionId, 'execute')
+  }
+
+  /** Continue a task leaf's own session after a host restart. */
+  private async resumeTask(task: TaskNode, project: Project): Promise<string> {
+    if (task.sessionId === undefined) throw new Error('resume requested but no session is attached')
+    const text = task.kind === 'research' || task.kind === 'design'
+      ? '宿主已重启，请检查你的产出文件是否完整，不完整则继续完成，然后结束回合。'
+      : '宿主已重启，你的任务尚未完成，请继续执行，全部完成后结束回合。'
+    return this.runner.resumeTaskSession(task.sessionId, text)
+  }
+
+  /** The confirmed clarification Q&A of a project (context for execute leaves). */
+  private clarifications(projectId: string): Array<{ question: string; answer: string }> {
+    return this.service.projectTasks(projectId)
+      .filter(task => task.kind === 'clarify' && task.answer !== undefined && task.question !== undefined)
+      .map(task => ({ question: task.question!, answer: task.answer! }))
+  }
+
+  private async runPhase(launch: () => Promise<{ kind: 'launched'; sessionId: string } | { kind: 'resumed'; sessionId: string }>): Promise<SpawnResult> {
     try {
       return await launch()
     } catch (error) {
@@ -107,7 +178,7 @@ export class KanbanSpawner {
     }
   }
 
-  private fail(project: Project, note: string): void {
+  private failProject(project: Project, note: string): void {
     try {
       this.service.markBlocked(project.id, note, 'system')
     } catch {
@@ -116,42 +187,112 @@ export class KanbanSpawner {
     }
   }
 
+  private failTask(task: TaskNode, note: string): void {
+    try {
+      this.service.markTaskBlocked(task.id, note, 'system')
+    } catch {
+      // The task may have moved concurrently; the board is authoritative.
+    }
+  }
+
   private async poll(): Promise<void> {
     if (this.disposed) return
     const running = await this.runner.listRunning()
     for (const project of this.service.snapshot().projects) {
-      if (project.sessionId === undefined) continue
-      const role = project.sessionRole
-      if (role !== 'design' && role !== 'execute') continue
-      if (project.status !== 'designing' && project.status !== 'executing') continue
-      const startedAt = this.launchedAt.get(project.sessionId) ?? 0
-      let outcome
-      try {
-        outcome = await this.runner.inspect(project.sessionId, startedAt, running.known ? running.items : undefined)
-      } catch {
-        continue // a transient inspection failure never settles a running phase
+      this.pollProject(project, running.known ? running.items : undefined)
+      for (const task of this.service.projectTasks(project.id)) {
+        if (task.kind === 'execute' && task.status === 'executing' && task.sessionId === undefined) {
+          // Execute leaves depend on the creator's clarifications: defer the
+          // spawn until every clarify leaf of the project is confirmed.
+          const pendingClarify = this.service.projectTasks(project.id)
+            .some(leaf => leaf.kind === 'clarify' && leaf.status !== 'done')
+          if (!pendingClarify) void this.enterTaskExecuting(task)
+          continue
+        }
+        this.pollTask(task, running.known ? running.items : undefined)
       }
-      if (outcome.outcome === 'pending') continue
-      this.launchedAt.delete(project.sessionId)
-      const note = 'error' in outcome ? `${outcome.outcome}: ${outcome.error}` : undefined
+    }
+  }
+
+  private pollProject(project: Project, sessions: readonly KanbanSessionSummary[] | undefined): void {
+    if (project.sessionId === undefined) return
+    const role = project.sessionRole
+    if (role !== 'design' && role !== 'execute') return
+    if (project.status !== 'designing' && project.status !== 'executing') return
+    const startedAt = this.launchedAt.get(project.sessionId) ?? 0
+    void this.inspectAndSettle(project.sessionId, startedAt, sessions, outcome => {
       if (outcome.outcome !== 'succeeded') {
-        this.fail(project, `session ${project.sessionId} ${note ?? outcome.outcome}`)
-        continue
+        this.failProject(project, `session ${project.sessionId} ${outcome.outcome}${'error' in outcome ? `: ${outcome.error}` : ''}`)
+        return
       }
       try {
         if (role === 'design') {
           if (!this.runner.planExists(project)) {
-            this.fail(project, `design ended but ${project.workspaceDir}/plan.md is missing`)
-            continue
+            this.failProject(project, `design ended but ${project.workspaceDir}/plan.md is missing`)
+            return
           }
-          this.service.reportDesignDone(project.id, join(project.workspaceDir, 'plan.md'), 'system')
+          this.service.reportDesignDone(project.id, `${project.workspaceDir}/plan.md`, 'system')
         } else {
           this.service.reportExecuteDone(project.id, 'system')
         }
       } catch {
         // The phase may have moved concurrently; the board is authoritative.
       }
+    })
+  }
+
+  private pollTask(task: TaskNode, sessions: readonly KanbanSessionSummary[] | undefined): void {
+    if (task.sessionId === undefined) return
+    const role = task.sessionRole
+    if (role !== 'research' && role !== 'design' && role !== 'execute') return
+    if (task.status !== 'designing' && task.status !== 'executing') return
+    const startedAt = this.launchedAt.get(task.sessionId) ?? 0
+    void this.inspectAndSettle(task.sessionId, startedAt, sessions, outcome => {
+      if (outcome.outcome !== 'succeeded') {
+        this.failTask(task, `session ${task.sessionId} ${outcome.outcome}${'error' in outcome ? `: ${outcome.error}` : ''}`)
+        return
+      }
+      try {
+        const project = this.service.getProject(task.projectId)
+        if (project === undefined) return
+        if (role === 'execute') {
+          this.service.reportTaskExecuteDone(task.id, 'system')
+          return
+        }
+        const artifactPath = taskArtifactPath(project.workspaceDir, task.id)
+        if (!existsSync(artifactPath)) {
+          this.failTask(task, `${role} ended but ${artifactPath} is missing`)
+          return
+        }
+        if (role === 'research') {
+          // Research conclusions need no human gate: verify and complete.
+          this.service.reportTaskArtifactDone(task.id, artifactPath, 'system')
+          this.service.verifyTaskDone(task.id, 'research artifact verified')
+        } else {
+          // Design parts keep the human confirmation gate.
+          this.service.reportTaskArtifactDone(task.id, artifactPath, 'system')
+        }
+      } catch {
+        // The task may have moved concurrently; the board is authoritative.
+      }
+    })
+  }
+
+  private async inspectAndSettle(
+    sessionId: string,
+    startedAt: number,
+    sessions: readonly KanbanSessionSummary[] | undefined,
+    settle: (outcome: Awaited<ReturnType<KanbanSessionRunner['inspect']>>) => void,
+  ): Promise<void> {
+    let outcome
+    try {
+      outcome = await this.runner.inspect(sessionId, startedAt, sessions)
+    } catch {
+      return // a transient inspection failure never settles a running phase
     }
+    if (outcome.outcome === 'pending') return
+    this.launchedAt.delete(sessionId)
+    settle(outcome)
   }
 
   private schedulePoll(): void {

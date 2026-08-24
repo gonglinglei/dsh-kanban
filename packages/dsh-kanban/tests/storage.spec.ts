@@ -38,7 +38,7 @@ describe('storage', () => {
 
   it('round-trips a state through save and load', () => {
     const file = join(dir, 'projects.json')
-    const state = { format: 1 as const, revision: 5, projects: [sampleProject()] }
+    const state = { format: 1 as const, revision: 5, projects: [sampleProject()], tasks: [] }
     saveState(file, state)
     expect(loadState(file)).toEqual(state)
   })

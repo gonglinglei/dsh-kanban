@@ -7,8 +7,15 @@
 /** HTTP prefix of every kanban host route. */
 export const KANBAN_API_PREFIX = '/kanban'
 
-/** One project's board status (the MVP state machine is flat per project). */
-export type ProjectStatus = 'backlog' | 'designing' | 'awaiting-review' | 'executing' | 'done' | 'blocked'
+/** One node's board status. The state machine is shared by projects and task leaves. */
+export type ProjectStatus =
+  | 'backlog'
+  | 'designing'
+  | 'awaiting-clarification'
+  | 'awaiting-review'
+  | 'executing'
+  | 'done'
+  | 'blocked'
 
 /** Who triggered a transition; the state machine enforces per-actor edges. */
 export type Actor = 'human' | 'agent' | 'system'
@@ -49,10 +56,39 @@ export interface Project {
   history: HistoryEntry[]
 }
 
+/** What a decomposed task leaf is about: clarify with the creator, research first, produce one design part, or execute. */
+export type TaskKind = 'clarify' | 'research' | 'design' | 'execute'
+
+/** One decomposed task leaf (the decomposition tree is flattened into leaves; inner nodes only contribute title paths). */
+export interface TaskNode {
+  id: string
+  projectId: string
+  /** Leaf title chain from the project root, e.g. "登录页 → 前端 → 表单校验". */
+  titlePath: string
+  kind: TaskKind
+  status: ProjectStatus
+  /** The clarifying question (clarify leaves). */
+  question?: string
+  /** The creator's answer (clarify leaves); awaiting-review until confirmed. */
+  answer?: string
+  /** Research/design artifact file (markdown). */
+  artifactPath?: string
+  /** The current/last agent session driving this leaf. */
+  sessionId?: string
+  sessionRole?: 'research' | 'design' | 'execute'
+  version: number
+  createdAt: number
+  updatedAt: number
+  lastActivityAt: number
+  /** Append-only transition log. */
+  history: HistoryEntry[]
+}
+
 /** Full board state served by /state and pushed over /events. */
 export interface KanbanSnapshot {
   revision: number
   projects: Project[]
+  tasks: TaskNode[]
 }
 
 /** Human-triggerable actions (the HTTP /action surface). */
@@ -62,6 +98,8 @@ export type KanbanAction =
   | { kind: 'reject-plan'; projectId: string; feedback: string }
   | { kind: 'transition'; projectId: string; to: ProjectStatus; note?: string }
   | { kind: 'delete-project'; projectId: string }
+  | { kind: 'answer-clarification'; projectId: string; taskId: string; answer: string }
+  | { kind: 'confirm-task'; projectId: string; taskId: string }
 
 /** One POST /action body. */
 export interface KanbanActionEnvelope {
@@ -119,6 +157,19 @@ export function parseActionEnvelope(body: string): KanbanActionEnvelope | undefi
       if (typeof a.projectId !== 'string' || a.projectId === '') return undefined
       return { requestId: envelope.requestId, action: { kind, projectId: a.projectId } }
     }
+    case 'answer-clarification': {
+      const a = action as { projectId?: unknown; taskId?: unknown; answer?: unknown }
+      if (typeof a.projectId !== 'string' || a.projectId === '') return undefined
+      if (typeof a.taskId !== 'string' || a.taskId === '') return undefined
+      if (typeof a.answer !== 'string' || a.answer.trim() === '') return undefined
+      return { requestId: envelope.requestId, action: { kind, projectId: a.projectId, taskId: a.taskId, answer: a.answer } }
+    }
+    case 'confirm-task': {
+      const a = action as { projectId?: unknown; taskId?: unknown }
+      if (typeof a.projectId !== 'string' || a.projectId === '') return undefined
+      if (typeof a.taskId !== 'string' || a.taskId === '') return undefined
+      return { requestId: envelope.requestId, action: { kind, projectId: a.projectId, taskId: a.taskId } }
+    }
     default:
       return undefined
   }
@@ -126,5 +177,5 @@ export function parseActionEnvelope(body: string): KanbanActionEnvelope | undefi
 
 /** Closed status list (switch points fall through to assertNever). */
 export const PROJECT_STATUSES: readonly ProjectStatus[] = [
-  'backlog', 'designing', 'awaiting-review', 'executing', 'done', 'blocked',
+  'backlog', 'designing', 'awaiting-clarification', 'awaiting-review', 'executing', 'done', 'blocked',
 ]

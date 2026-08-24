@@ -13,17 +13,18 @@
  */
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
-import type { KanbanSnapshot, Project } from './protocol.ts'
+import type { KanbanSnapshot, Project, TaskNode } from './protocol.ts'
 
-/** On-disk shape (revision + projects; versioned for future migrations). */
+/** On-disk shape (revision + projects + task leaves; versioned for future migrations). */
 export interface PersistedState {
   format: 1
   revision: number
   projects: Project[]
+  tasks: TaskNode[]
 }
 
 export function emptyState(): PersistedState {
-  return { format: 1, revision: 0, projects: [] }
+  return { format: 1, revision: 0, projects: [], tasks: [] }
 }
 
 /** Load the ledger; a missing file yields an empty state. */
@@ -40,7 +41,8 @@ export function loadState(file: string): PersistedState {
     if (parsed.format !== 1 || !Array.isArray(parsed.projects) || typeof parsed.revision !== 'number') {
       throw new Error(`unsupported format: ${JSON.stringify(parsed.format)}`)
     }
-    return { format: 1, revision: parsed.revision, projects: parsed.projects }
+    // tasks is additive (pre-decomposition ledgers have none).
+    return { format: 1, revision: parsed.revision, projects: parsed.projects, tasks: parsed.tasks ?? [] }
   } catch (error) {
     const aside = `${file}.corrupt-${Date.now()}`
     renameSync(file, aside)

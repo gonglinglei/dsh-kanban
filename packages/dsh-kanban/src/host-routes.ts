@@ -60,6 +60,10 @@ function applyAction(service: KanbanHostService, action: KanbanAction): unknown 
     case 'delete-project':
       service.deleteProject(action.projectId)
       return undefined
+    case 'answer-clarification':
+      return service.answerClarification(action.projectId, action.taskId, action.answer)
+    case 'confirm-task':
+      return service.confirmTask(action.projectId, action.taskId)
   }
 }
 

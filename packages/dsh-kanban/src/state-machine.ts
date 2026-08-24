@@ -32,9 +32,11 @@ export function transitionAllowed(from: ProjectStatus, to: ProjectStatus, actor:
   if (from === to) return false
   if (actor === 'human') return true
   if (actor === 'system') {
-    // The host drives creation into design, phase outcomes, and staleness.
+    // The host drives creation into design, phase outcomes, artifact
+    // verification (research leaves: awaiting-review -> done), and staleness.
     if (from === 'backlog' && to === 'designing') return true
     if (from === 'designing' && to === 'awaiting-review') return true
+    if (from === 'awaiting-review' && to === 'done') return true
     if (from === 'executing' && to === 'done') return true
     if (to === 'blocked') return true
     return false
