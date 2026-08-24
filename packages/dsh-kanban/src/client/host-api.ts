@@ -11,6 +11,8 @@ const REQUEST_TIMEOUT_MS = 15_000
 export interface KanbanHostTransport {
   state(): Promise<KanbanSnapshot>
   action(action: KanbanAction): Promise<KanbanSnapshot>
+  /** Read one project artifact (plan.md preview); kept out of the snapshot on purpose. */
+  file(path: string): Promise<string>
   subscribe(listener: (payload?: KanbanEventPayload) => void): () => void
 }
 
@@ -19,8 +21,19 @@ function uuid(): string {
 }
 
 async function readJson<T>(response: Response): Promise<T> {
-  const body = await response.json() as T & { error?: string }
-  if (!response.ok) throw new Error(body.error ?? `kanban request failed: ${response.status}`)
+  const text = await response.text()
+  let body: (T & { error?: string }) | undefined
+  if (text !== '') {
+    try {
+      body = JSON.parse(text) as T & { error?: string }
+    } catch {
+      throw new Error(`kanban host returned non-JSON response (HTTP ${response.status})`)
+    }
+  }
+  if (!response.ok) {
+    throw new Error(body?.error ?? `kanban request failed: HTTP ${response.status}`)
+  }
+  if (body === undefined) throw new Error(`kanban host returned empty response (HTTP ${response.status})`)
   return body
 }
 
@@ -38,6 +51,14 @@ export class HttpKanbanHostTransport implements KanbanHostTransport {
       body: JSON.stringify(envelope),
     })
     return body.snapshot
+  }
+
+  async file(path: string): Promise<string> {
+    const body = await this.request<{ ok: boolean; content: string }>(
+      `${KANBAN_API_PREFIX}/file?path=${encodeURIComponent(path)}`,
+      { cache: 'no-store' },
+    )
+    return body.content
   }
 
   private async request<T>(url: string, init: RequestInit): Promise<T> {

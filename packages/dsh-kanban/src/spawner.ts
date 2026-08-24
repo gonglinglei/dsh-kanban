@@ -113,6 +113,9 @@ export class KanbanSpawner {
   private async enterTaskDesigning(task: TaskNode): Promise<void> {
     const project = this.service.getProject(task.projectId)
     if (project === undefined) return
+    // Dependency scheduling: spawn only when every declared dependency (and,
+    // for execute leaves, every clarification) is done.
+    if (!this.dependenciesReady(task)) return
     const result = await this.runPhase(async () => {
       // Host-restart recovery: the leaf's own session resumes.
       if (task.sessionId !== undefined && task.sessionRole === task.kind) {
@@ -134,12 +137,9 @@ export class KanbanSpawner {
   private async enterTaskExecuting(task: TaskNode): Promise<void> {
     const project = this.service.getProject(task.projectId)
     if (project === undefined) return
-    // Execute leaves depend on the creator's clarifications: defer the spawn
-    // until every clarify leaf of the project is confirmed. The poll loop
-    // re-enters this hook once the dependency clears.
-    const pendingClarify = this.service.projectTasks(task.projectId)
-      .some(leaf => leaf.kind === 'clarify' && leaf.status !== 'done')
-    if (pendingClarify) return
+    // Dependency scheduling: execute leaves spawn only when their declared
+    // dependencies and every clarification of the project are done.
+    if (!this.dependenciesReady(task)) return
     const result = await this.runPhase(async () => {
       if (task.sessionId !== undefined && task.sessionRole === 'execute') {
         return { kind: 'resumed', sessionId: await this.resumeTask(task, project) }
@@ -161,6 +161,31 @@ export class KanbanSpawner {
       ? '宿主已重启，请检查你的产出文件是否完整，不完整则继续完成，然后结束回合。'
       : '宿主已重启，你的任务尚未完成，请继续执行，全部完成后结束回合。'
     return this.runner.resumeTaskSession(task.sessionId, text)
+  }
+
+  /** Whether a leaf is in a spawn-eligible status but has no session yet. */
+  private isAwaitingSpawn(task: TaskNode): boolean {
+    if (task.kind === 'clarify') return false
+    if (task.kind === 'research' || task.kind === 'design') return task.status === 'designing'
+    return task.status === 'executing'
+  }
+
+  /**
+   * Whether a leaf may spawn: every declared dependency is done, and execute
+   * leaves additionally wait for the project's clarifications (their prompt
+   * carries the Q&A).
+   */
+  private dependenciesReady(task: TaskNode): boolean {
+    for (const dependencyId of task.dependencies) {
+      const dependency = this.service.getTask(dependencyId)
+      if (dependency === undefined || dependency.status !== 'done') return false
+    }
+    if (task.kind === 'execute') {
+      const pendingClarify = this.service.projectTasks(task.projectId)
+        .some(leaf => leaf.kind === 'clarify' && leaf.status !== 'done')
+      if (pendingClarify) return false
+    }
+    return true
   }
 
   /** The confirmed clarification Q&A of a project (context for execute leaves). */
@@ -199,28 +224,27 @@ export class KanbanSpawner {
     if (this.disposed) return
     const running = await this.runner.listRunning()
     for (const project of this.service.snapshot().projects) {
-      this.pollProject(project, running.known ? running.items : undefined)
+      // Phase 1: settle running sessions (their reports may release
+      // dependents). Phase 2: trigger leaves whose dependencies just cleared,
+      // so a dependency chain advances within one tick.
+      await this.pollProject(project, running.known ? running.items : undefined)
+      await Promise.all(this.service.projectTasks(project.id).map(task => this.pollTask(task, running.known ? running.items : undefined)))
       for (const task of this.service.projectTasks(project.id)) {
-        if (task.kind === 'execute' && task.status === 'executing' && task.sessionId === undefined) {
-          // Execute leaves depend on the creator's clarifications: defer the
-          // spawn until every clarify leaf of the project is confirmed.
-          const pendingClarify = this.service.projectTasks(project.id)
-            .some(leaf => leaf.kind === 'clarify' && leaf.status !== 'done')
-          if (!pendingClarify) void this.enterTaskExecuting(task)
-          continue
+        if (task.sessionId === undefined && this.isAwaitingSpawn(task) && this.dependenciesReady(task)) {
+          if (task.kind === 'execute') void this.enterTaskExecuting(task)
+          else void this.enterTaskDesigning(task)
         }
-        this.pollTask(task, running.known ? running.items : undefined)
       }
     }
   }
 
-  private pollProject(project: Project, sessions: readonly KanbanSessionSummary[] | undefined): void {
+  private async pollProject(project: Project, sessions: readonly KanbanSessionSummary[] | undefined): Promise<void> {
     if (project.sessionId === undefined) return
     const role = project.sessionRole
     if (role !== 'design' && role !== 'execute') return
     if (project.status !== 'designing' && project.status !== 'executing') return
     const startedAt = this.launchedAt.get(project.sessionId) ?? 0
-    void this.inspectAndSettle(project.sessionId, startedAt, sessions, outcome => {
+    await this.inspectAndSettle(project.sessionId, startedAt, sessions, outcome => {
       if (outcome.outcome !== 'succeeded') {
         this.failProject(project, `session ${project.sessionId} ${outcome.outcome}${'error' in outcome ? `: ${outcome.error}` : ''}`)
         return
@@ -241,13 +265,13 @@ export class KanbanSpawner {
     })
   }
 
-  private pollTask(task: TaskNode, sessions: readonly KanbanSessionSummary[] | undefined): void {
+  private async pollTask(task: TaskNode, sessions: readonly KanbanSessionSummary[] | undefined): Promise<void> {
     if (task.sessionId === undefined) return
     const role = task.sessionRole
     if (role !== 'research' && role !== 'design' && role !== 'execute') return
     if (task.status !== 'designing' && task.status !== 'executing') return
     const startedAt = this.launchedAt.get(task.sessionId) ?? 0
-    void this.inspectAndSettle(task.sessionId, startedAt, sessions, outcome => {
+    await this.inspectAndSettle(task.sessionId, startedAt, sessions, outcome => {
       if (outcome.outcome !== 'succeeded') {
         this.failTask(task, `session ${task.sessionId} ${outcome.outcome}${'error' in outcome ? `: ${outcome.error}` : ''}`)
         return

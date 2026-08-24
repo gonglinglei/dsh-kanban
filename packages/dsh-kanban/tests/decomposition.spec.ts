@@ -40,10 +40,10 @@ describe('parseDecomposition', () => {
   it('flattens the tree into leaves; inner nodes only contribute title prefixes', () => {
     const leaves = flattenDecomposition(parseDecomposition(JSON.stringify(NESTED)))
     expect(leaves).toEqual([
-      { titlePath: '明确需求', kind: 'clarify', question: '目标用户是谁？' },
-      { titlePath: '后端 > 数据库设计', kind: 'design' },
-      { titlePath: '后端 > API 实现', kind: 'execute' },
-      { titlePath: '竞品调研', kind: 'research' },
+      { titlePath: '明确需求', kind: 'clarify', question: '目标用户是谁？', dependsOn: [] },
+      { titlePath: '后端 > 数据库设计', kind: 'design', dependsOn: [] },
+      { titlePath: '后端 > API 实现', kind: 'execute', dependsOn: [] },
+      { titlePath: '竞品调研', kind: 'research', dependsOn: [] },
     ])
   })
 

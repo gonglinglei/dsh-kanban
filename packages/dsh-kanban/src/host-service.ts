@@ -9,8 +9,9 @@
  * broadcasts the new snapshot to /events subscribers.
  */
 import { randomUUID } from 'node:crypto'
-import { join } from 'node:path'
-import { flattenDecomposition, loadDecomposition, type TaskLeaf } from './decomposition.ts'
+import { readFileSync, statSync } from 'node:fs'
+import { isAbsolute, join, resolve, sep } from 'node:path'
+import { DecompositionError, flattenDecomposition, loadDecomposition, type TaskLeaf } from './decomposition.ts'
 import type {
   Actor, HistoryEntry, KanbanEventPayload, KanbanSnapshot, Project, ProjectStatus, TaskKind, TaskNode,
 } from './protocol.ts'
@@ -22,6 +23,9 @@ const STALE_TICK_SECONDS = 30
 
 /** The design agent's decomposition file, next to plan.md. */
 export const DECOMPOSITION_FILE = 'tasks.json'
+
+/** Per-file size ceiling for readProjectFile (the detail view's plan preview). */
+export const PROJECT_FILE_LIMIT = 512 * 1024
 
 export interface CreateProjectInput {
   title: string
@@ -147,6 +151,32 @@ export class KanbanHostService {
   /** All task leaves of one project. */
   projectTasks(projectId: string): TaskNode[] {
     return this.state.tasks.filter(task => task.projectId === projectId)
+  }
+
+  /**
+   * Read a utf-8 text artifact (e.g. plan.md) for the detail view. The path
+   * must resolve inside some project's workspaceDir — the whitelist that
+   * keeps this route from becoming an arbitrary file read. Throws Error with
+   * a machine-readable message: path-not-absolute / path-outside-workspace /
+   * file-not-found / not-a-file / file-too-large.
+   */
+  readProjectFile(path: string): string {
+    if (!isAbsolute(path)) throw new Error('path-not-absolute')
+    const normalized = resolve(path)
+    const allowed = this.state.projects.some(project => {
+      const root = resolve(project.workspaceDir)
+      return normalized === root || normalized.startsWith(root + sep)
+    })
+    if (!allowed) throw new Error('path-outside-workspace')
+    let stat
+    try {
+      stat = statSync(normalized)
+    } catch {
+      throw new Error('file-not-found')
+    }
+    if (!stat.isFile()) throw new Error('not-a-file')
+    if (stat.size > PROJECT_FILE_LIMIT) throw new Error('file-too-large')
+    return readFileSync(normalized, 'utf8')
   }
 
   /** Create a project in backlog, then immediately auto-start design (system actor). */
@@ -379,9 +409,15 @@ export class KanbanHostService {
     return flattenDecomposition(decomposition)
   }
 
-  /** Create the task leaves and fire their phase hooks (parallel execution). */
+  /**
+   * Create the task leaves and fire their phase hooks. Dependency references
+   * resolve to leaf ids and the graph must be acyclic; a broken reference or
+   * a cycle fails the whole materialization loudly (nothing is half-created).
+   */
   private materializeTasks(project: Project, leaves: TaskLeaf[]): void {
     const now = Date.now()
+    const byPath = new Map<string, TaskNode>()
+    const pending: TaskNode[] = []
     for (const leaf of leaves) {
       const task: TaskNode = {
         id: randomUUID(),
@@ -389,6 +425,7 @@ export class KanbanHostService {
         titlePath: leaf.titlePath,
         kind: leaf.kind,
         status: initialTaskStatus(leaf.kind),
+        dependencies: [],
         ...(leaf.question === undefined ? {} : { question: leaf.question }),
         version: 0,
         createdAt: now,
@@ -396,6 +433,22 @@ export class KanbanHostService {
         lastActivityAt: now,
         history: [],
       }
+      if (byPath.has(leaf.titlePath)) throw new DecompositionError(`duplicate task title path: ${leaf.titlePath}`)
+      byPath.set(leaf.titlePath, task)
+      pending.push(task)
+    }
+    for (const task of pending) {
+      const leaf = leaves.find(candidate => candidate.titlePath === task.titlePath)!
+      task.dependencies = leaf.dependsOn.map(ref => {
+        const dependency = byPath.get(ref)
+        if (dependency === undefined) {
+          throw new DecompositionError(`task "${task.titlePath}" depends on unknown task "${ref}"`)
+        }
+        return dependency.id
+      })
+    }
+    assertAcyclic(pending)
+    for (const task of pending) {
       this.state.tasks.push(task)
       this.taskCommit(task, 'system', 'backlog', task.status, 'materialized')
       const created = this.requireTask(task.id)
@@ -450,3 +503,22 @@ export function initialTaskStatus(kind: TaskKind): ProjectStatus {
   }
 }
 
+
+/** Fail loudly when the dependency graph has a cycle. */
+function assertAcyclic(tasks: TaskNode[]): void {
+  const byId = new Map(tasks.map(task => [task.id, task]))
+  const visiting = new Set<string>()
+  const visited = new Set<string>()
+  const visit = (task: TaskNode): void => {
+    if (visited.has(task.id)) return
+    if (visiting.has(task.id)) throw new DecompositionError(`dependency cycle at "${task.titlePath}"`)
+    visiting.add(task.id)
+    for (const dependencyId of task.dependencies) {
+      const dependency = byId.get(dependencyId)
+      if (dependency !== undefined) visit(dependency)
+    }
+    visiting.delete(task.id)
+    visited.add(task.id)
+  }
+  for (const task of tasks) visit(task)
+}

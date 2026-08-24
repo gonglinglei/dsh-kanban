@@ -42,7 +42,13 @@ export function loadState(file: string): PersistedState {
       throw new Error(`unsupported format: ${JSON.stringify(parsed.format)}`)
     }
     // tasks is additive (pre-decomposition ledgers have none).
-    return { format: 1, revision: parsed.revision, projects: parsed.projects, tasks: parsed.tasks ?? [] }
+    // Normalize: persisted tasks may be missing array fields from older versions.
+    const tasks = (parsed.tasks ?? []).map(t => ({
+      ...t,
+      dependencies: Array.isArray(t.dependencies) ? t.dependencies : [],
+      history: Array.isArray(t.history) ? t.history : [],
+    }))
+    return { format: 1, revision: parsed.revision, projects: parsed.projects, tasks }
   } catch (error) {
     const aside = `${file}.corrupt-${Date.now()}`
     renameSync(file, aside)

@@ -136,6 +136,34 @@ export function makeKanbanRoutes(service: KanbanHostService): WebRoute[] {
     },
   }
 
+  /**
+   * Read one project artifact (plan.md preview). GET-only; the service
+   * enforces the workspaceDir prefix whitelist, the 512KB ceiling, and the
+   * regular-file check; the loopback fence applies like everywhere else.
+   */
+  const file: WebRoute = {
+    kind: 'exact',
+    path: `${KANBAN_API_PREFIX}/file`,
+    handler: (req, res): void => {
+      if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method-not-allowed' })
+      if (!guard(req, res)) return
+      const url = new URL(req.url ?? '', 'http://localhost')
+      const path = url.searchParams.get('path')
+      if (path === null || path === '') return json(res, 400, { ok: false, error: 'path-required' })
+      try {
+        const content = service.readProjectFile(path)
+        json(res, 200, { ok: true, path, content })
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        const status = message === 'path-outside-workspace' ? 403
+          : message === 'file-too-large' ? 413
+          : message === 'file-not-found' || message === 'not-a-file' ? 404
+          : 400
+        json(res, status, { ok: false, error: message })
+      }
+    },
+  }
+
   const health: WebRoute = {
     kind: 'exact',
     path: `${KANBAN_API_PREFIX}/health`,
@@ -145,5 +173,5 @@ export function makeKanbanRoutes(service: KanbanHostService): WebRoute[] {
     },
   }
 
-  return [state, action, events, health]
+  return [state, action, events, file, health]
 }

@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -63,6 +63,22 @@ describe('KanbanSessionRunner', () => {
     expect(api.sessions.prompted[0]?.sessionId).toBe(sessionId)
     expect(api.sessions.prompted[0]?.text).toContain('build a thing')
     expect(api.sessions.prompted[0]?.text).toContain(join(dir, 'plan.md'))
+  })
+
+  it('launchDesign clears stale artifacts so an old plan/tasks.json cannot leak into the new phase', async () => {
+    const api = new FakeApi()
+    const runner = new KanbanSessionRunner(api)
+    const project = sampleProject()
+    // Stale artifacts from a previous design round.
+    writeFileSync(join(dir, 'plan.md'), '旧方案', 'utf8')
+    writeFileSync(join(dir, 'tasks.json'), '{"tasks":[]}', 'utf8')
+    mkdirSync(join(dir, '.kanban', 'artifacts'), { recursive: true })
+    writeFileSync(join(dir, '.kanban', 'artifacts', 'old.md'), 'x', 'utf8')
+
+    await runner.launchDesign(project)
+    expect(existsSync(join(dir, 'plan.md'))).toBe(false)
+    expect(existsSync(join(dir, 'tasks.json'))).toBe(false)
+    expect(existsSync(join(dir, '.kanban'))).toBe(false)
   })
 
   it('launches an execution session with the confirmed plan path', async () => {

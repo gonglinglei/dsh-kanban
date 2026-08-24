@@ -161,6 +161,49 @@ describe('KanbanSpawner task leaves', () => {
     expect(service.getTask(execute.id)?.status).toBe('done')
   })
 
+  it('a leaf with dependencies does not spawn until they are done', async () => {
+    const service = makeService()
+    const api = new FakeApi()
+    const spawner = new KanbanSpawner(service, api)
+    spawner.start()
+    const project = service.createProject({ title: 't', workspaceDir: dir, goal: 'g' })
+    writeFileSync(join(dir, 'tasks.json'), JSON.stringify({
+      decomposed: true,
+      tasks: [
+        { title: '架构设计', kind: 'design' },
+        { title: '编码实现', kind: 'execute', dependsOn: ['架构设计'] },
+        { title: '测试验证', kind: 'execute', dependsOn: ['编码实现'] },
+      ],
+    }), 'utf8')
+    service.confirmPlan(project.id)
+    await flush(1)
+
+    const design = service.projectTasks(project.id).find(task => task.titlePath === '架构设计')!
+    const code = service.projectTasks(project.id).find(task => task.titlePath === '编码实现')!
+    const test = service.projectTasks(project.id).find(task => task.titlePath === '测试验证')!
+    // Only the design leaf spawned: code and test wait on dependencies.
+    expect(design.sessionId).toBeDefined()
+    expect(code.sessionId).toBeUndefined()
+    expect(test.sessionId).toBeUndefined()
+
+    // Design completes -> code spawns; test still waits.
+    mkdirSync(join(dir, '.kanban', 'artifacts'), { recursive: true })
+    writeFileSync(join(dir, '.kanban', 'artifacts', `${design.id}.md`), '# 设计', 'utf8')
+    api.sessions.summaries.set(design.sessionId!, { sessionId: design.sessionId!, running: false })
+    api.sessions.histories.set(design.sessionId!, [turnEnd(Date.now() + 1)])
+    await flush()
+    service.confirmTask(project.id, design.id)
+    await flush()
+    expect(service.getTask(code.id)?.sessionId).toBeDefined()
+    expect(service.getTask(test.id)?.sessionId).toBeUndefined()
+
+    // Code completes -> test spawns.
+    api.sessions.summaries.set(code.sessionId!, { sessionId: code.sessionId!, running: false })
+    api.sessions.histories.set(code.sessionId!, [turnEnd(Date.now() + 1)])
+    await flush()
+    expect(service.getTask(test.id)?.sessionId).toBeDefined()
+  })
+
   it('the project completes when its last leaf settles', async () => {
     const service = makeService()
     const api = new FakeApi()

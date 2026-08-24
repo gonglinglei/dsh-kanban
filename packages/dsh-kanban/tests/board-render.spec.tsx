@@ -14,6 +14,10 @@ import { BoardStore } from '../src/client/store.ts'
 import { isBoardOpen, toggleBoard } from '../src/client/view-state.ts'
 import { FakeTransport } from './fake-transport.ts'
 
+// Opt into React's act environment: every render/click in this suite is
+// already wrapped in act; the flag turns the act(...) misuse warnings off.
+globalThis.IS_REACT_ACT_ENVIRONMENT = true
+
 let container: HTMLDivElement
 
 beforeEach(() => {
@@ -34,6 +38,7 @@ function task(overrides: Partial<TaskNode> = {}): TaskNode {
     kind: 'clarify',
     status: 'awaiting-clarification',
     question: '数据源是什么？',
+    dependencies: [],
     version: 1,
     createdAt: 0,
     updatedAt: 0,
@@ -77,7 +82,7 @@ async function renderBoard(store: BoardStore, openSession = vi.fn(), getDefaultW
   await act(async () => {
     root.render(<Board store={store} openSession={openSession} getDefaultWorkspaceDir={getDefaultWorkspaceDir} />)
   })
-  return () => { root.unmount() }
+  return () => { act(() => { root.unmount() }) }
 }
 
 describe('Board rendering', () => {

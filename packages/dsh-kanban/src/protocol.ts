@@ -76,6 +76,8 @@ export interface TaskNode {
   /** The current/last agent session driving this leaf. */
   sessionId?: string
   sessionRole?: 'research' | 'design' | 'execute'
+  /** Ids of sibling leaves that must be done before this leaf spawns. */
+  dependencies: string[]
   version: number
   createdAt: number
   updatedAt: number

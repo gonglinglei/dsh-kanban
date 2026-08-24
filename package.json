@@ -7,6 +7,7 @@
   "scripts": {
     "build": "pnpm --filter dsh-kanban build",
     "typecheck": "pnpm --filter dsh-kanban typecheck",
+    "test": "pnpm --filter dsh-kanban test",
     "watch": "pnpm --filter dsh-kanban watch"
   },
   "license": "Apache-2.0",

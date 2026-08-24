@@ -7,7 +7,7 @@
  * the launch timestamp; a turn/end whose data.reason.kind is 'error' is a
  * failure. The poll loop lives in spawner.ts.
  */
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Project, TaskNode } from './protocol.ts'
 
@@ -99,6 +99,11 @@ export function designPrompt(project: Project): string {
     '   kind 取值：clarify=需与创建人明确目标/输入（必须带 question）；research=需提前调研；',
     '   design=复杂设计的一部分（可嵌套 subtasks 继续拆解）；execute=任务的具体执行。',
     '   拆解可以嵌套任意深度，只有最底层（没有 subtasks）的任务会被执行。',
+    '   子任务之间有先后依赖时，用 dependsOn 声明（值为同项目其他子任务的标题，嵌套子任务用',
+    '   "父标题 > 子标题" 的完整路径）：如编码实现依赖架构设计、测试验证依赖编码实现时：',
+    '     { "title": "编码实现", "kind": "execute", "dependsOn": ["架构设计"] },',
+    '     { "title": "测试验证", "kind": "execute", "dependsOn": ["编码实现"] }',
+    '   有依赖关系的子任务必须在依赖完成后才能开始，请务必声明清楚。',
     '4. 如果任务可直接执行，不要写 tasks.json。',
     '5. 全部完成后结束你的回合，不要继续做其他事。',
   ].join('\n')
@@ -195,7 +200,20 @@ export class KanbanSessionRunner {
 
   /** Create + rename + prompt a fresh design session; returns the session id. */
   async launchDesign(project: Project): Promise<string> {
+    this.clearStaleArtifacts(project)
     return this.launch(project, designPrompt(project), `${project.title}·设计`)
+  }
+
+  /**
+   * A fresh design round must start from a clean directory: a leftover
+   * plan.md/tasks.json from a previous project would either be reused by the
+   * agent ("the plan already exists") or materialized as a stale
+   * decomposition on confirm. Resume rounds (rejections) never clear.
+   */
+  private clearStaleArtifacts(project: Project): void {
+    rmSync(join(project.workspaceDir, 'plan.md'), { force: true })
+    rmSync(join(project.workspaceDir, 'tasks.json'), { force: true })
+    rmSync(join(project.workspaceDir, '.kanban'), { recursive: true, force: true })
   }
 
   /** Create + rename + prompt a fresh execution session; returns the session id. */

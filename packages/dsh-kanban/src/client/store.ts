@@ -69,6 +69,11 @@ export class BoardStore {
     this.notify()
   }
 
+  /** Read one project artifact through the transport (detail view's plan preview; not cached in the snapshot). */
+  async readFile(path: string): Promise<string> {
+    return this.transport.file(path)
+  }
+
   /** Send one human action; the host's response snapshot becomes the new view. */
   async apply(action: KanbanAction): Promise<void> {
     try {

@@ -22,6 +22,8 @@ export interface DecompositionTask {
   title: string
   kind: TaskKind
   question?: string
+  /** Titles (or title paths) of sibling leaves this task depends on; the leaf spawns only when all are done. */
+  dependsOn?: string[]
   subtasks?: DecompositionTask[]
 }
 
@@ -30,11 +32,12 @@ export interface Decomposition {
   tasks: DecompositionTask[]
 }
 
-/** One flattened leaf: its title chain and its own metadata. */
+/** One flattened leaf: its title chain, its own metadata, and its dependency references. */
 export interface TaskLeaf {
   titlePath: string
   kind: TaskKind
   question?: string
+  dependsOn: string[]
 }
 
 export class DecompositionError extends Error {
@@ -71,6 +74,9 @@ function validateTask(task: unknown, path: string): asserts task is Decompositio
   if (t.kind === 'clarify' && (typeof t.question !== 'string' || t.question.trim() === '')) {
     throw new DecompositionError(`clarify task "${t.title}" needs a question`)
   }
+  if (t.dependsOn !== undefined && (!Array.isArray(t.dependsOn) || t.dependsOn.some(ref => typeof ref !== 'string' || ref.trim() === ''))) {
+    throw new DecompositionError(`task "${t.title}" dependsOn must be an array of titles`)
+  }
   if (t.subtasks !== undefined && !Array.isArray(t.subtasks)) {
     throw new DecompositionError(`task "${t.title}" subtasks must be an array`)
   }
@@ -91,7 +97,12 @@ export function flattenDecomposition(decomposition: Decomposition): TaskLeaf[] {
       if (task.subtasks !== undefined && task.subtasks.length > 0) {
         walk(task.subtasks, path)
       } else {
-        leaves.push({ titlePath: path, kind: task.kind, ...(task.question === undefined ? {} : { question: task.question }) })
+        leaves.push({
+          titlePath: path,
+          kind: task.kind,
+          dependsOn: task.dependsOn ?? [],
+          ...(task.question === undefined ? {} : { question: task.question }),
+        })
       }
     }
   }

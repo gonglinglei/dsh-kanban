@@ -151,3 +151,48 @@ describe('KanbanHostService task decomposition', () => {
     expect(second.projectTasks(projectId)).toHaveLength(4)
   })
 })
+
+describe('KanbanHostService dependency graph', () => {
+  it('resolves dependsOn titles to leaf ids', () => {
+    const service = makeService()
+    const project = service.createProject({ title: 't', workspaceDir: dir, goal: 'g' })
+    writeFileSync(join(dir, 'tasks.json'), JSON.stringify({
+      decomposed: true,
+      tasks: [
+        { title: '架构设计', kind: 'design' },
+        { title: '编码实现', kind: 'execute', dependsOn: ['架构设计'] },
+      ],
+    }), 'utf8')
+    service.confirmPlan(project.id)
+    const design = service.projectTasks(project.id).find(task => task.titlePath === '架构设计')!
+    const execute = service.projectTasks(project.id).find(task => task.titlePath === '编码实现')!
+    expect(execute.dependencies).toEqual([design.id])
+  })
+
+  it('fails loudly on an unknown dependency reference', () => {
+    const service = makeService()
+    const project = service.createProject({ title: 't', workspaceDir: dir, goal: 'g' })
+    writeFileSync(join(dir, 'tasks.json'), JSON.stringify({
+      decomposed: true,
+      tasks: [
+        { title: '编码实现', kind: 'execute', dependsOn: ['不存在的任务'] },
+      ],
+    }), 'utf8')
+    expect(() => service.confirmPlan(project.id)).toThrowError(/depends on unknown task/)
+    // Nothing was half-materialized.
+    expect(service.projectTasks(project.id)).toHaveLength(0)
+  })
+
+  it('fails loudly on a dependency cycle', () => {
+    const service = makeService()
+    const project = service.createProject({ title: 't', workspaceDir: dir, goal: 'g' })
+    writeFileSync(join(dir, 'tasks.json'), JSON.stringify({
+      decomposed: true,
+      tasks: [
+        { title: 'A', kind: 'execute', dependsOn: ['B'] },
+        { title: 'B', kind: 'execute', dependsOn: ['A'] },
+      ],
+    }), 'utf8')
+    expect(() => service.confirmPlan(project.id)).toThrowError(/dependency cycle/)
+  })
+})

@@ -60,6 +60,7 @@ html[data-dsh-kanban-active] [class*='centerCol'] > :not([data-dsh-kanban-view])
   border: 1px solid var(--dsw-alias-border, #d0d0d0); color: var(--dsw-alias-text-secondary, #666);
 }
 [data-dsh-kanban-view] .dk-card-error { margin: 0; font-size: 12px; color: #b3261e; }
+[data-dsh-kanban-view] .dk-card-waiting { margin: 0; font-size: 12px; color: #b26a00; }
 [data-dsh-kanban-view] .dk-card-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 [data-dsh-kanban-view] .dk-btn {
   border: 1px solid var(--dsw-alias-border, #d0d0d0); background: var(--dsw-alias-bg-base, #fff);
@@ -94,4 +95,53 @@ html[data-dsh-kanban-active] [class*='centerCol'] > :not([data-dsh-kanban-view])
 [data-dsh-kanban-view] .dk-modal-error { margin: 0; font-size: 12px; color: #b3261e; }
 [data-dsh-kanban-view] .dk-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 [data-dsh-kanban-view] .dk-empty { font-size: 12px; color: var(--dsw-alias-text-tertiary, #999); padding: 4px; }
+
+/* Project detail view (full-screen switch inside the board container). */
+[data-dsh-kanban-view] .dk-detail { display: flex; flex-direction: column; height: 100%; box-sizing: border-box; }
+[data-dsh-kanban-view] .dk-detail-body {
+  flex: 1 1 auto; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 16px;
+  max-width: 880px;
+}
+[data-dsh-kanban-view] .dk-detail-section {
+  background: var(--dsw-alias-bg-subtle, #f4f5f7); border-radius: 8px; padding: 12px 14px;
+  display: flex; flex-direction: column; gap: 8px;
+}
+[data-dsh-kanban-view] .dk-detail-heading { margin: 0; font-size: 13px; font-weight: 600; }
+[data-dsh-kanban-view] .dk-detail-grid {
+  margin: 0; display: grid; grid-template-columns: 88px 1fr; gap: 6px 12px; font-size: 12px;
+}
+[data-dsh-kanban-view] .dk-detail-grid dt { color: var(--dsw-alias-text-tertiary, #999); }
+[data-dsh-kanban-view] .dk-detail-grid dd { margin: 0; word-break: break-all; }
+[data-dsh-kanban-view] .dk-detail-task {
+  background: var(--dsw-alias-bg-base, #fff); border: 1px solid var(--dsw-alias-border, #e0e0e0);
+  border-radius: 6px; padding: 8px 10px; display: flex; flex-direction: column; gap: 4px;
+}
+[data-dsh-kanban-view] .dk-detail-task-path { margin: 0; font-size: 12px; font-weight: 600; word-break: break-all; }
+[data-dsh-kanban-view] .dk-detail-history {
+  margin: 0; padding: 0 0 0 4px; list-style: none; display: flex; flex-direction: column; gap: 6px;
+  border-left: 2px solid var(--dsw-alias-border, #e0e0e0);
+}
+[data-dsh-kanban-view] .dk-detail-history li {
+  display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; font-size: 12px; padding-left: 8px;
+}
+[data-dsh-kanban-view] .dk-detail-history-time { color: var(--dsw-alias-text-tertiary, #999); font-variant-numeric: tabular-nums; }
+[data-dsh-kanban-view] .dk-detail-history-actor { font-weight: 600; }
+[data-dsh-kanban-view] .dk-detail-history-note { color: var(--dsw-alias-text-secondary, #666); word-break: break-all; }
+
+/* Lightweight markdown subset (plan preview). */
+[data-dsh-kanban-view] .dk-md { font-size: 13px; line-height: 1.6; word-break: break-word; }
+[data-dsh-kanban-view] .dk-md h4, [data-dsh-kanban-view] .dk-md h5, [data-dsh-kanban-view] .dk-md h6 {
+  margin: 10px 0 4px; font-size: 13px; font-weight: 600;
+}
+[data-dsh-kanban-view] .dk-md p { margin: 4px 0; }
+[data-dsh-kanban-view] .dk-md ul, [data-dsh-kanban-view] .dk-md ol { margin: 4px 0; padding-left: 20px; }
+[data-dsh-kanban-view] .dk-md code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+  background: var(--dsw-alias-bg-base, #fff); border-radius: 4px; padding: 1px 4px;
+}
+[data-dsh-kanban-view] .dk-md-code {
+  margin: 6px 0; padding: 8px 10px; overflow-x: auto; border-radius: 6px;
+  background: var(--dsw-alias-bg-base, #fff); border: 1px solid var(--dsw-alias-border, #e0e0e0);
+}
+[data-dsh-kanban-view] .dk-md-code code { background: none; padding: 0; }
 `
