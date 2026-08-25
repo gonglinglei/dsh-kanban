@@ -28,6 +28,7 @@ describe('transitionAllowed', () => {
 
   it('lets the system drive creation, phase outcomes, and staleness', () => {
     expect(transitionAllowed('backlog', 'designing', 'system')).toBe(true)
+    expect(transitionAllowed('backlog', 'executing', 'system')).toBe(true) // long-running creation
     expect(transitionAllowed('designing', 'awaiting-review', 'system')).toBe(true)
     expect(transitionAllowed('executing', 'done', 'system')).toBe(true)
     expect(transitionAllowed('designing', 'blocked', 'system')).toBe(true)
@@ -35,6 +36,13 @@ describe('transitionAllowed', () => {
     expect(transitionAllowed('awaiting-review', 'blocked', 'system')).toBe(true)
     expect(transitionAllowed('backlog', 'done', 'system')).toBe(false)
     expect(transitionAllowed('awaiting-review', 'executing', 'system')).toBe(false)
+  })
+
+  it('keeps the long-running creation edge system-only (agents never take it)', () => {
+    expect(transitionAllowed('backlog', 'executing', 'agent')).toBe(false)
+    expect(transitionAllowed('backlog', 'executing', 'human')).toBe(true)
+    expect(() => assertTransitionAllowed('backlog', 'executing', 'agent'))
+      .toThrowError(/agent may not move a project from backlog to executing/)
   })
 
   it('throws TransitionError with the actor and edge in the message', () => {

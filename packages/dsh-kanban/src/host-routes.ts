@@ -50,7 +50,13 @@ function readBody(req: IncomingMessage, limit: number): Promise<{ raw: string; v
 function applyAction(service: KanbanHostService, action: KanbanAction): unknown {
   switch (action.kind) {
     case 'create-project':
-      return service.createProject({ title: action.title, workspaceDir: action.workspaceDir, goal: action.goal })
+      return service.createProject({
+        title: action.title,
+        workspaceDir: action.workspaceDir,
+        goal: action.goal,
+        ...(action.lifecycle === undefined ? {} : { lifecycle: action.lifecycle }),
+        ...(action.parentId === undefined ? {} : { parentId: action.parentId }),
+      })
     case 'confirm-plan':
       return service.confirmPlan(action.projectId)
     case 'reject-plan':

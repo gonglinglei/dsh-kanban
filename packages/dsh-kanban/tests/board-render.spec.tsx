@@ -9,6 +9,7 @@ import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Project, TaskNode } from '../src/protocol.ts'
+import { CAPABILITY_LONG_RUNNING_PROJECTS } from '../src/protocol.ts'
 import { Board } from '../src/client/board.tsx'
 import { BoardStore } from '../src/client/store.ts'
 import { isBoardOpen, toggleBoard } from '../src/client/view-state.ts'
@@ -86,6 +87,199 @@ async function renderBoard(store: BoardStore, openSession = vi.fn(), getDefaultW
   })
   return () => { act(() => { root.unmount() }) }
 }
+
+/** Pick a <select> option the way React sees it: through the native value setter. */
+function selectOption(element: HTMLSelectElement, value: string): void {
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value')!.set!
+  setter.call(element, value)
+  element.dispatchEvent(new Event('change', { bubbles: true }))
+}
+
+/** Open the new-project modal (the header「+ 新建项目」button). */
+async function openModal(): Promise<void> {
+  const createButton = [...container.querySelectorAll('button')].find(button => button.textContent?.includes('新建项目'))
+  expect(createButton, 'the「+ 新建项目」button must exist').toBeDefined()
+  await act(async () => { createButton!.click() })
+}
+
+describe('Long-running projects and affiliation', () => {
+  it('the new-project modal defaults to one-shot and offers only long-running projects as parents', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = {
+      revision: 1,
+      capabilities: [CAPABILITY_LONG_RUNNING_PROJECTS],
+      projects: [
+        project({ id: 'lp1', title: '长期主线', status: 'executing', lifecycle: 'long-running', sessionId: undefined }),
+        project({ id: 'os1', title: '普通项目', status: 'executing' }),
+      ],
+      tasks: [],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    const unmount = await renderBoard(store)
+    // A capable host shows no version-mismatch banner.
+    expect(container.querySelector('.dk-banner')).toBeNull()
+    await openModal()
+
+    const radios = [...container.querySelectorAll<HTMLInputElement>('input[type="radio"][name="dk-lifecycle"]')]
+    expect(radios).toHaveLength(2)
+    expect(radios[0].checked, 'one-shot is the default').toBe(true)
+    expect(container.textContent).toContain('一次性项目')
+    expect(container.textContent).toContain('长期执行中的项目')
+
+    // The parent select lists only long-running projects, never one-shot ones.
+    const select = container.querySelector<HTMLSelectElement>('#dk-parent')
+    expect(select, 'the parent select is visible for a one-shot project').not.toBeNull()
+    const optionTexts = [...select!.querySelectorAll('option')].map(option => option.textContent)
+    expect(optionTexts).toEqual(['不关联', '长期主线'])
+    // One-shot keeps the design-relay submit label.
+    expect([...container.querySelectorAll('button')].some(button => button.textContent === '创建并开始设计')).toBe(true)
+    unmount()
+  })
+
+  it('choosing a parent forwards parentId with the create-project action', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = {
+      revision: 1,
+      capabilities: [CAPABILITY_LONG_RUNNING_PROJECTS],
+      projects: [project({ id: 'lp1', title: '长期主线', status: 'executing', lifecycle: 'long-running', sessionId: undefined })],
+      tasks: [],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    await renderBoard(store)
+    await openModal()
+    await act(async () => {
+      typeInto(container.querySelector<HTMLInputElement>('#dk-title')!, '子项目')
+      typeInto(container.querySelector<HTMLInputElement>('#dk-workspace')!, '/path/child')
+      typeInto(container.querySelector<HTMLInputElement>('#dk-goal')!, '具体一件事')
+      selectOption(container.querySelector<HTMLSelectElement>('#dk-parent')!, 'lp1')
+    })
+    const submit = [...container.querySelectorAll('button')].find(button => button.textContent === '创建并开始设计')
+    await act(async () => { submit!.click() })
+    expect(transport.actions).toEqual([{
+      kind: 'create-project',
+      title: '子项目',
+      workspaceDir: '/path/child',
+      goal: '具体一件事',
+      parentId: 'lp1',
+    }])
+  })
+
+  it('selecting the long-running type hides the parent select and submits lifecycle: long-running', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = {
+      revision: 1,
+      capabilities: [CAPABILITY_LONG_RUNNING_PROJECTS],
+      projects: [project({ id: 'lp1', title: '长期主线', status: 'executing', lifecycle: 'long-running', sessionId: undefined })],
+      tasks: [],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    await renderBoard(store)
+    await openModal()
+
+    // Switch to the long-running type (the second radio).
+    const longRunningRadio = [...container.querySelectorAll<HTMLInputElement>('input[type="radio"][name="dk-lifecycle"]')][1]
+    await act(async () => { longRunningRadio.click() })
+    expect(longRunningRadio.checked).toBe(true)
+    // Affiliation is one-shot-only: the select disappears (no nesting).
+    expect(container.querySelector('#dk-parent')).toBeNull()
+    expect([...container.querySelectorAll('button')].some(button => button.textContent === '创建长期项目')).toBe(true)
+
+    await act(async () => {
+      typeInto(container.querySelector<HTMLInputElement>('#dk-title')!, '新主线')
+      typeInto(container.querySelector<HTMLInputElement>('#dk-workspace')!, '/path/main')
+      typeInto(container.querySelector<HTMLInputElement>('#dk-goal')!, '持续演进')
+    })
+    const submit = [...container.querySelectorAll('button')].find(button => button.textContent === '创建长期项目')
+    await act(async () => { submit!.click() })
+    // No parentId key even though a long-running project exists on the board.
+    expect(transport.actions).toEqual([{
+      kind: 'create-project',
+      title: '新主线',
+      workspaceDir: '/path/main',
+      goal: '持续演进',
+      lifecycle: 'long-running',
+    }])
+  })
+
+  it('cards show the 长期 badge on long-running projects and a 隶属于 line on affiliated children', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = {
+      revision: 1,
+      capabilities: [CAPABILITY_LONG_RUNNING_PROJECTS],
+      projects: [
+        project({ id: 'lp1', title: '长期主线', status: 'executing', lifecycle: 'long-running', sessionId: undefined }),
+        project({ id: 'c1', title: '子项目甲', status: 'executing', parentId: 'lp1', sessionId: undefined }),
+        project({ id: 'c2', title: '孤儿项目', status: 'executing', parentId: 'gone', sessionId: undefined }),
+        project({ id: 'os1', title: '普通项目', status: 'executing' }),
+      ],
+      tasks: [],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    const unmount = await renderBoard(store)
+
+    const cards = [...container.querySelectorAll<HTMLElement>('.dk-card')]
+    const longCard = cards.find(card => card.textContent?.includes('长期主线'))
+    expect(longCard?.querySelector('.dk-card-title .dk-kind-badge')?.textContent).toBe('长期')
+
+    const childCard = cards.find(card => card.textContent?.includes('子项目甲'))
+    expect(childCard?.querySelector('.dk-card-parent')?.textContent).toBe('隶属于 长期主线')
+
+    const orphanCard = cards.find(card => card.textContent?.includes('孤儿项目'))
+    expect(orphanCard?.querySelector('.dk-card-parent')?.textContent).toBe('隶属于 （父项目已删除）')
+
+    const plainCard = cards.find(card => card.textContent?.includes('普通项目'))
+    expect(plainCard?.querySelector('.dk-card-title .dk-kind-badge')).toBeNull()
+    expect(plainCard?.querySelector('.dk-card-parent')).toBeNull()
+    unmount()
+  })
+
+  it('a snapshot without capabilities (old host) hides the long-running UI and shows the restart banner', async () => {
+    const transport = new FakeTransport()
+    // No `capabilities` key at all: exactly what a pre-handshake host serves.
+    transport.stateValue = {
+      revision: 1,
+      projects: [project({ id: 'lp1', title: '长期主线', status: 'executing', lifecycle: 'long-running', sessionId: undefined })],
+      tasks: [],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    const unmount = await renderBoard(store)
+
+    // The board-top banner explains why the long-running entry is gone.
+    expect(container.querySelector('.dk-banner')?.textContent)
+      .toContain('看板 host 版本过旧，不支持长期项目；请重启 DSH 后刷新页面')
+
+    await openModal()
+    // No「项目类型」radio row — the modal can only submit a one-shot create.
+    expect(container.querySelectorAll('input[type="radio"][name="dk-lifecycle"]')).toHaveLength(0)
+    expect(container.textContent).not.toContain('长期执行中的项目')
+    // The affiliation select is hidden too (old hosts never learned parentId either).
+    expect(container.querySelector('#dk-parent')).toBeNull()
+    expect([...container.querySelectorAll('button')].some(button => button.textContent === '创建长期项目')).toBe(false)
+
+    // The forced one-shot path still submits cleanly, byte-identical to a
+    // pre-feature create (no lifecycle / parentId keys).
+    await act(async () => {
+      typeInto(container.querySelector<HTMLInputElement>('#dk-title')!, '普通项目')
+      typeInto(container.querySelector<HTMLInputElement>('#dk-workspace')!, '/path/os')
+      typeInto(container.querySelector<HTMLInputElement>('#dk-goal')!, '一件事')
+    })
+    const submit = [...container.querySelectorAll('button')].find(button => button.textContent === '创建并开始设计')
+    expect(submit, 'the one-shot submit stays available on an old host').toBeDefined()
+    await act(async () => { submit!.click() })
+    expect(transport.actions).toEqual([{
+      kind: 'create-project',
+      title: '普通项目',
+      workspaceDir: '/path/os',
+      goal: '一件事',
+    }])
+    unmount()
+  })
+})
 
 describe('Board rendering', () => {
   it('renders all six columns with project cards in their columns', async () => {

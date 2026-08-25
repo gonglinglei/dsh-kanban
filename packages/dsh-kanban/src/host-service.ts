@@ -12,6 +12,7 @@ import { randomUUID } from 'node:crypto'
 import { readFileSync, rmSync, statSync } from 'node:fs'
 import { isAbsolute, resolve, sep } from 'node:path'
 import { DecompositionError, flattenDecomposition, loadDecomposition, type TaskLeaf } from './decomposition.ts'
+import { HOST_CAPABILITIES } from './protocol.ts'
 import type {
   Actor, HistoryEntry, KanbanEventPayload, KanbanSnapshot, Project, ProjectStatus, TaskKind, TaskNode,
 } from './protocol.ts'
@@ -32,6 +33,10 @@ export interface CreateProjectInput {
   title: string
   workspaceDir: string
   goal: string
+  /** 'long-running' creates a long-running board container; absent means one-shot. */
+  lifecycle?: 'long-running'
+  /** Affiliation to an existing long-running project (one-shot projects only). */
+  parentId?: string
 }
 
 /** Hook fired when a project enters designing; the spawner wires sessions here. */
@@ -127,7 +132,15 @@ export class KanbanHostService {
   }
 
   snapshot(): KanbanSnapshot {
-    return { revision: this.state.revision, projects: this.state.projects, tasks: this.state.tasks }
+    // Capabilities are assembled fresh from the running build (never read
+    // from the ledger), so a restarted host on new code immediately
+    // re-declares what it supports — the version-mismatch handshake.
+    return {
+      revision: this.state.revision,
+      projects: this.state.projects,
+      tasks: this.state.tasks,
+      capabilities: [...HOST_CAPABILITIES],
+    }
   }
 
   eventPayload(): KanbanEventPayload {
@@ -180,8 +193,23 @@ export class KanbanHostService {
     return readFileSync(normalized, 'utf8')
   }
 
-  /** Create a project in backlog, then immediately auto-start design (system actor). */
+  /**
+   * Create a project in backlog, then immediately auto-start design (system
+   * actor). A long-running project instead moves straight into executing —
+   * it is a pure board container: no design agent, never auto-done.
+   * A one-shot project may affiliate to an existing long-running parent.
+   */
   createProject(input: CreateProjectInput): Project {
+    if (input.parentId !== undefined) {
+      if (input.lifecycle === 'long-running') {
+        throw new TransitionError('long-running projects cannot belong to another project')
+      }
+      const parent = this.getProject(input.parentId)
+      if (parent === undefined) throw new TransitionError(`unknown parent project ${input.parentId}`)
+      if (parent.lifecycle !== 'long-running') {
+        throw new TransitionError(`parent project ${input.parentId} is not a long-running project`)
+      }
+    }
     const now = Date.now()
     const project: Project = {
       id: randomUUID(),
@@ -189,6 +217,8 @@ export class KanbanHostService {
       workspaceDir: input.workspaceDir,
       goal: input.goal,
       status: 'backlog',
+      ...(input.lifecycle === undefined ? {} : { lifecycle: input.lifecycle }),
+      ...(input.parentId === undefined ? {} : { parentId: input.parentId }),
       version: 0,
       createdAt: now,
       updatedAt: now,
@@ -197,6 +227,12 @@ export class KanbanHostService {
     }
     this.state.projects.push(project)
     this.commit(project, 'system', 'backlog', 'backlog', 'created')
+    if (input.lifecycle === 'long-running') {
+      // 长期项目创建: straight into long-running execution; the spawner's
+      // enterExecuting guard keeps this from spawning any agent session.
+      this.applyTransition(project.id, 'executing', 'system', '长期项目创建', { fireHooks: true })
+      return this.requireProject(project.id)
+    }
     // 新建即自动跑: the design phase starts without a human click.
     this.applyTransition(project.id, 'designing', 'system', 'auto-start design', { fireHooks: true })
     return this.requireProject(project.id)
@@ -257,8 +293,10 @@ export class KanbanHostService {
     return this.requireProject(projectId)
   }
 
-  /** The execution agent's turn ended. */
+  /** The execution agent's turn ended. Long-running projects never auto-complete. */
   reportExecuteDone(projectId: string, actor: Actor = 'system'): Project {
+    const project = this.requireProject(projectId)
+    if (project.lifecycle === 'long-running') return project
     this.applyTransition(projectId, 'done', actor, 'execution done', { fireHooks: false })
     return this.requireProject(projectId)
   }
@@ -275,11 +313,18 @@ export class KanbanHostService {
     return this.requireProject(projectId)
   }
 
-  /** Remove a project and its task leaves entirely (human). */
+  /** Remove a project and its task leaves entirely (human). Children of a deleted long-running project keep living, un-affiliated. */
   deleteProject(projectId: string): void {
     const index = this.state.projects.findIndex(project => project.id === projectId)
     if (index < 0) throw new TransitionError(`unknown project ${projectId}`)
     const project = this.state.projects[index]!
+    // Deleting a long-running project dissolves affiliations, never children.
+    for (const child of this.state.projects) {
+      if (child.parentId === projectId) {
+        child.parentId = undefined
+        this.commit(child, 'system', child.status, child.status, '父长期项目已删除，关联解除')
+      }
+    }
     this.state.projects.splice(index, 1)
     this.state.tasks = this.state.tasks.filter(task => task.projectId !== projectId)
     // Hygiene: the project's on-disk artifacts go with it.
@@ -491,6 +536,8 @@ export class KanbanHostService {
     if (this.maxStaleMinutes <= 0) return
     const cutoff = Date.now() - this.maxStaleMinutes * 60_000
     for (const project of this.state.projects) {
+      // Long-running projects live in executing forever; staleness is meaningless for them.
+      if (project.lifecycle === 'long-running') continue
       if (project.status !== 'designing' && project.status !== 'executing') continue
       if (project.lastActivityAt > cutoff) continue
       try {

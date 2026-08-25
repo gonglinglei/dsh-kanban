@@ -7,6 +7,7 @@ import {
   decompositionPathFor,
   designPrompt,
   executePrompt,
+  executeTaskPrompt,
   KanbanSessionRunner,
   planPathFor,
   projectDir,
@@ -179,5 +180,24 @@ describe('KanbanSessionRunner', () => {
     expect(executePrompt(project)).toContain(planPathFor(project))
     expect(resumePrompt(project)).toContain('改一下')
     expect(resumePrompt(project)).toContain(planPathFor(project))
+  })
+
+  it('injects the parent long-running project context into execute prompts', () => {
+    const project = sampleProject({ status: 'executing', parentId: 'p-parent' })
+    const parent = { title: '主线建设', goal: '持续演进' }
+    expect(executePrompt(project, parent)).toContain('本项目隶属于长期项目：主线建设 — 持续演进')
+    expect(executeTaskPrompt(
+      { id: 't1', projectId: project.id, titlePath: '实现功能', kind: 'execute', status: 'executing', dependencies: [], version: 0, createdAt: 0, updatedAt: 0, lastActivityAt: 0, history: [] },
+      project,
+      [],
+      parent,
+    )).toContain('本项目隶属于长期项目：主线建设 — 持续演进')
+    // Without a parent the line is absent.
+    expect(executePrompt(project)).not.toContain('隶属于长期项目')
+    expect(executeTaskPrompt(
+      { id: 't1', projectId: project.id, titlePath: '实现功能', kind: 'execute', status: 'executing', dependencies: [], version: 0, createdAt: 0, updatedAt: 0, lastActivityAt: 0, history: [] },
+      project,
+      [],
+    )).not.toContain('隶属于长期项目')
   })
 })

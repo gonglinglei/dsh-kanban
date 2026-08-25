@@ -16,7 +16,7 @@
 import { existsSync } from 'node:fs'
 import type { KanbanHostService } from './host-service.ts'
 import type { Project, TaskNode } from './protocol.ts'
-import { KanbanSessionRunner, planPathFor, taskArtifactPath, type KanbanApi, type KanbanSessionSummary } from './session-runner.ts'
+import { KanbanSessionRunner, planPathFor, taskArtifactPath, type KanbanApi, type KanbanSessionSummary, type ParentProjectContext } from './session-runner.ts'
 
 const SESSION_POLL_MS = 5_000
 
@@ -98,13 +98,17 @@ export class KanbanSpawner {
   }
 
   private async enterExecuting(project: Project): Promise<void> {
+    // Long-running projects are pure board containers: no agent session ever.
+    // This guard also covers pollProject (no sessionId → early return) and
+    // host-restart refirePhaseHooks.
+    if (project.lifecycle === 'long-running') return
     const result = await this.runPhase(async () => {
       // Host-restart recovery: a run that was already attached to a session
       // continues in that session; only a phase with no session spawns fresh.
       if (project.sessionId !== undefined && project.sessionRole === 'execute') {
         return { kind: 'resumed', sessionId: await this.runner.resumeExecute(project) }
       }
-      return { kind: 'launched', sessionId: await this.runner.launchExecute(project) }
+      return { kind: 'launched', sessionId: await this.runner.launchExecute(project, this.parentContext(project)) }
     })
     if (result.kind === 'failed') {
       this.failProject(project, `execution phase: ${result.error}`)
@@ -148,7 +152,7 @@ export class KanbanSpawner {
       if (task.sessionId !== undefined && task.sessionRole === 'execute') {
         return { kind: 'resumed', sessionId: await this.resumeTask(task, project) }
       }
-      return { kind: 'launched', sessionId: await this.runner.launchExecuteTask(task, project, this.clarifications(task.projectId)) }
+      return { kind: 'launched', sessionId: await this.runner.launchExecuteTask(task, project, this.clarifications(task.projectId), this.parentContext(project)) }
     })
     if (result.kind === 'failed') {
       this.failTask(task, `execution phase: ${result.error}`)
@@ -197,6 +201,13 @@ export class KanbanSpawner {
     return this.service.projectTasks(projectId)
       .filter(task => task.kind === 'clarify' && task.answer !== undefined && task.question !== undefined)
       .map(task => ({ question: task.question!, answer: task.answer! }))
+  }
+
+  /** The parent long-running project's identity (one context line in execute prompts). */
+  private parentContext(project: Project): ParentProjectContext | undefined {
+    if (project.parentId === undefined) return undefined
+    const parent = this.service.getProject(project.parentId)
+    return parent === undefined ? undefined : { title: parent.title, goal: parent.goal }
   }
 
   private async runPhase(launch: () => Promise<{ kind: 'launched'; sessionId: string } | { kind: 'resumed'; sessionId: string }>): Promise<SpawnResult> {

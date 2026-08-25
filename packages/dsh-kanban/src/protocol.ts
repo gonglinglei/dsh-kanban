@@ -30,6 +30,9 @@ export interface HistoryEntry {
   note?: string
 }
 
+/** Project lifecycle: the classic one-shot relay, or a long-running board container. */
+export type ProjectLifecycle = 'one-shot' | 'long-running'
+
 /** One project card. */
 export interface Project {
   id: string
@@ -39,6 +42,17 @@ export interface Project {
   /** One-line goal entered at creation. */
   goal: string
   status: ProjectStatus
+  /**
+   * Lifecycle form; absent means 'one-shot' (pre-feature ledgers need no
+   * migration). A 'long-running' project enters executing on creation, never
+   * spawns agent sessions, and never auto-completes — only a human moves it.
+   */
+  lifecycle?: ProjectLifecycle
+  /**
+   * The long-running project this one-shot project belongs to (board
+   * affiliation only). Only one-shot projects may set it; never nested.
+   */
+  parentId?: string
   /** Per-project mutation counter (optimistic-concurrency evidence). */
   version: number
   createdAt: number
@@ -86,16 +100,38 @@ export interface TaskNode {
   history: HistoryEntry[]
 }
 
+/** Capability token: the host understands lifecycle: 'long-running' on create-project. */
+export const CAPABILITY_LONG_RUNNING_PROJECTS = 'long-running-projects'
+
+/** Protocol capabilities the current host build supports (assembled per snapshot, never persisted). */
+export const HOST_CAPABILITIES: readonly string[] = [CAPABILITY_LONG_RUNNING_PROJECTS]
+
 /** Full board state served by /state and pushed over /events. */
 export interface KanbanSnapshot {
   revision: number
   projects: Project[]
   tasks: TaskNode[]
+  /**
+   * Host→client capability handshake: the host lists the protocol features
+   * it actually implements so a newer client never offers UI the running
+   * host would silently drop. Absent means a pre-handshake host, which
+   * supports nothing beyond the one-shot relay.
+   */
+  capabilities?: string[]
 }
 
 /** Human-triggerable actions (the HTTP /action surface). */
 export type KanbanAction =
-  | { kind: 'create-project'; title: string; workspaceDir: string; goal: string }
+  | {
+      kind: 'create-project'
+      title: string
+      workspaceDir: string
+      goal: string
+      /** 'long-running' creates a long-running project; absent means one-shot. */
+      lifecycle?: 'long-running'
+      /** Optional affiliation to an existing long-running project (one-shot only). */
+      parentId?: string
+    }
   | { kind: 'confirm-plan'; projectId: string }
   | { kind: 'reject-plan'; projectId: string; feedback: string }
   | { kind: 'transition'; projectId: string; to: ProjectStatus; note?: string }
@@ -128,11 +164,25 @@ export function parseActionEnvelope(body: string): KanbanActionEnvelope | undefi
   const kind = (action as { kind?: unknown }).kind
   switch (kind) {
     case 'create-project': {
-      const a = action as { title?: unknown; workspaceDir?: unknown; goal?: unknown }
+      const a = action as { title?: unknown; workspaceDir?: unknown; goal?: unknown; lifecycle?: unknown; parentId?: unknown }
       if (typeof a.title !== 'string' || a.title.trim() === '') return undefined
       if (typeof a.workspaceDir !== 'string' || a.workspaceDir.trim() === '') return undefined
       if (typeof a.goal !== 'string' || a.goal.trim() === '') return undefined
-      return { requestId: envelope.requestId, action: { kind, title: a.title, workspaceDir: a.workspaceDir, goal: a.goal } }
+      if (a.lifecycle !== undefined && a.lifecycle !== 'long-running') return undefined
+      if (a.parentId !== undefined && (typeof a.parentId !== 'string' || a.parentId === '')) return undefined
+      const lifecycle = a.lifecycle as 'long-running' | undefined
+      const parentId = a.parentId as string | undefined
+      return {
+        requestId: envelope.requestId,
+        action: {
+          kind,
+          title: a.title,
+          workspaceDir: a.workspaceDir,
+          goal: a.goal,
+          ...(lifecycle === undefined ? {} : { lifecycle }),
+          ...(parentId === undefined ? {} : { parentId }),
+        },
+      }
     }
     case 'confirm-plan': {
       const a = action as { projectId?: unknown }

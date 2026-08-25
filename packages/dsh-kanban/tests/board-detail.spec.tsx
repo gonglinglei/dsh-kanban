@@ -316,3 +316,114 @@ describe('Project detail view', () => {
     expect(container.querySelector('.dk-columns')).not.toBeNull()
   })
 })
+
+/** Open the detail view of the card whose title contains the given text (long-running cards carry a badge, so the kind-badge heuristic does not apply). */
+async function openDetailOf(title: string): Promise<void> {
+  const card = [...container.querySelectorAll<HTMLElement>('.dk-card')]
+    .find(candidate => candidate.querySelector('.dk-card-title')?.textContent?.includes(title))
+  expect(card, `a card titled「${title}」must exist`).toBeDefined()
+  const found = [...card!.querySelectorAll('button')].find(candidate => candidate.textContent === '详情')
+  expect(found, `the「${title}」card「详情」button must exist`).toBeDefined()
+  await act(async () => { found!.click() })
+}
+
+describe('Lifecycle and affiliation in the detail view', () => {
+  it('a long-running project detail shows its lifecycle and lists its child projects', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = {
+      revision: 1,
+      projects: [
+        project({ id: 'lp1', title: '长期主线', status: 'executing', lifecycle: 'long-running', sessionId: undefined, planPath: undefined }),
+        project({ id: 'c1', title: '子项目甲', status: 'executing', parentId: 'lp1', sessionId: undefined, planPath: undefined }),
+        project({ id: 'c2', title: '子项目乙', status: 'done', parentId: 'lp1', sessionId: undefined, planPath: undefined }),
+        project({ id: 'os1', title: '无关项目', status: 'executing', sessionId: undefined, planPath: undefined }),
+      ],
+      tasks: [],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    const unmount = await renderBoard(store)
+    await openDetailOf('长期主线')
+
+    const text = container.textContent ?? ''
+    expect(text).toContain('长期执行中')
+    expect(text).toContain('名下子项目(2)')
+    expect(text).toContain('子项目甲')
+    expect(text).toContain('子项目乙')
+    // One-shot projects are not listed as children.
+    const childSection = [...container.querySelectorAll<HTMLElement>('.dk-detail-section')]
+      .find(section => section.querySelector('.dk-detail-heading')?.textContent?.startsWith('名下子项目'))
+    expect(childSection).toBeDefined()
+    expect(childSection!.textContent).not.toContain('无关项目')
+    // A long-running project has no parent row.
+    expect(text).not.toContain('所属长期项目')
+    unmount()
+  })
+
+  it('clicking a child project in the list opens that child\'s detail', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = {
+      revision: 1,
+      projects: [
+        project({ id: 'lp1', title: '长期主线', status: 'executing', lifecycle: 'long-running', sessionId: undefined, planPath: undefined }),
+        project({ id: 'c1', title: '子项目甲', status: 'executing', parentId: 'lp1', sessionId: undefined, planPath: undefined }),
+      ],
+      tasks: [],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    await renderBoard(store)
+    await openDetailOf('长期主线')
+
+    const childSection = [...container.querySelectorAll<HTMLElement>('.dk-detail-section')]
+      .find(section => section.querySelector('.dk-detail-heading')?.textContent?.startsWith('名下子项目'))!
+    const childDetailButton = [...childSection.querySelectorAll('button')].find(candidate => candidate.textContent === '详情')
+    await act(async () => { childDetailButton!.click() })
+
+    // The detail view switched to the child project.
+    expect(container.querySelector('.dk-title')?.textContent).toBe('子项目甲')
+    expect(container.textContent).not.toContain('名下子项目')
+  })
+
+  it('an affiliated one-shot project detail shows its lifecycle and parent project', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = {
+      revision: 1,
+      projects: [
+        project({ id: 'lp1', title: '长期主线', status: 'executing', lifecycle: 'long-running', sessionId: undefined, planPath: undefined }),
+        project({ id: 'c1', title: '子项目甲', status: 'executing', parentId: 'lp1', sessionId: undefined, planPath: undefined }),
+      ],
+      tasks: [],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    const unmount = await renderBoard(store)
+    await openDetailOf('子项目甲')
+
+    const text = container.textContent ?? ''
+    expect(text).toContain('生命周期')
+    expect(text).toContain('一次性')
+    expect(text).toContain('所属长期项目')
+    expect(text).toContain('长期主线')
+    expect(text).not.toContain('名下子项目')
+    unmount()
+  })
+
+  it('a child detail whose parent was deleted shows the fallback instead of a title', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = {
+      revision: 1,
+      projects: [project({ id: 'c1', title: '子项目甲', status: 'executing', parentId: 'gone', sessionId: undefined, planPath: undefined })],
+      tasks: [],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    const unmount = await renderBoard(store)
+    await openDetailOf('子项目甲')
+
+    expect(container.textContent).toContain('所属长期项目')
+    expect(container.textContent).toContain('（父项目已删除）')
+    unmount()
+  })
+})
+

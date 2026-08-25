@@ -34,6 +34,11 @@ describe('KanbanHostService', () => {
       ['backlog', 'designing', 'system'],
     ])
     expect(service.snapshot().revision).toBe(2)
+    // The capability handshake rides every snapshot: the client disables
+    // UI the running host does not declare, so this field must never be
+    // dropped from /state or /events payloads.
+    expect(service.snapshot().capabilities).toEqual(['long-running-projects'])
+    expect(service.eventPayload().capabilities).toEqual(['long-running-projects'])
   })
 
   it('fires the onEnterDesigning hook on create and on rejection', () => {
@@ -138,5 +143,107 @@ describe('KanbanHostService', () => {
     vi.advanceTimersByTime(30_000)
     expect(service.getProject(running.id)?.status).toBe('designing')
     expect(service.getProject(done.id)?.status).toBe('done')
+  })
+})
+
+describe('long-running projects and affiliation', () => {
+  it('creates a long-running project straight into executing, without the design hook', () => {
+    const service = makeService()
+    const designHits: string[] = []
+    const executeHits: string[] = []
+    service.setSpawnHooks({
+      onEnterDesigning: project => { designHits.push(project.id) },
+      onEnterExecuting: project => { executeHits.push(project.id) },
+      onEnterTaskDesigning: () => {},
+      onEnterTaskExecuting: () => {},
+    })
+    const project = service.createProject({ title: '主线', workspaceDir: '/w', goal: 'g', lifecycle: 'long-running' })
+    expect(project.status).toBe('executing')
+    expect(project.lifecycle).toBe('long-running')
+    expect(designHits).toEqual([])
+    // The executing hook fires (the spawner's own guard is what suppresses sessions).
+    expect(executeHits).toEqual([project.id])
+    expect(project.history.map(entry => [entry.from, entry.to, entry.actor])).toEqual([
+      ['backlog', 'backlog', 'system'],
+      ['backlog', 'executing', 'system'],
+    ])
+    expect(project.history.at(-1)?.note).toBe('长期项目创建')
+  })
+
+  it('affiliates a one-shot project to a long-running parent', () => {
+    const service = makeService()
+    const parent = service.createProject({ title: '主线', workspaceDir: '/w', goal: 'g', lifecycle: 'long-running' })
+    const child = service.createProject({ title: '子项', workspaceDir: '/w', goal: 'g', parentId: parent.id })
+    expect(child.parentId).toBe(parent.id)
+    expect(child.lifecycle).toBeUndefined()
+    // The child still runs the classic one-shot relay.
+    expect(child.status).toBe('designing')
+  })
+
+  it('rejects affiliating to an unknown parent', () => {
+    const service = makeService()
+    expect(() => service.createProject({ title: 't', workspaceDir: '/w', goal: 'g', parentId: 'ghost' }))
+      .toThrowError(TransitionError)
+  })
+
+  it('rejects affiliating to a non-long-running parent', () => {
+    const service = makeService()
+    const oneShot = service.createProject({ title: 't', workspaceDir: '/w', goal: 'g' })
+    expect(() => service.createProject({ title: 'c', workspaceDir: '/w', goal: 'g', parentId: oneShot.id }))
+      .toThrowError(/not a long-running project/)
+  })
+
+  it('rejects a long-running project with a parent (affiliation never nests)', () => {
+    const service = makeService()
+    const parent = service.createProject({ title: '主线', workspaceDir: '/w', goal: 'g', lifecycle: 'long-running' })
+    expect(() => service.createProject({ title: 'nested', workspaceDir: '/w', goal: 'g', lifecycle: 'long-running', parentId: parent.id }))
+      .toThrowError(TransitionError)
+  })
+
+  it('never auto-completes a long-running project (reportExecuteDone is ignored)', () => {
+    const service = makeService()
+    const project = service.createProject({ title: '主线', workspaceDir: '/w', goal: 'g', lifecycle: 'long-running' })
+    service.reportExecuteDone(project.id, 'system')
+    expect(service.getProject(project.id)?.status).toBe('executing')
+    // A one-shot project in executing still completes normally.
+    const oneShot = service.createProject({ title: 't', workspaceDir: '/w', goal: 'g' })
+    service.transition(oneShot.id, 'executing')
+    service.reportExecuteDone(oneShot.id, 'system')
+    expect(service.getProject(oneShot.id)?.status).toBe('done')
+  })
+
+  it('never parks a long-running project into blocked via the stale timer', () => {
+    const service = makeService()
+    service.setMaxStaleMinutes(1)
+    const project = service.createProject({ title: '主线', workspaceDir: '/w', goal: 'g', lifecycle: 'long-running' })
+    vi.advanceTimersByTime(10 * 60_000)
+    expect(service.getProject(project.id)?.status).toBe('executing')
+  })
+
+  it('deleting a long-running project un-affiliates its children without deleting them', () => {
+    const service = makeService()
+    const parent = service.createProject({ title: '主线', workspaceDir: '/w', goal: 'g', lifecycle: 'long-running' })
+    const child = service.createProject({ title: '子项', workspaceDir: '/w', goal: 'g', parentId: parent.id })
+    service.deleteProject(parent.id)
+    expect(service.getProject(parent.id)).toBeUndefined()
+    const surviving = service.getProject(child.id)
+    expect(surviving).toBeDefined()
+    expect(surviving?.parentId).toBeUndefined()
+    expect(surviving?.history.at(-1)?.note).toContain('关联解除')
+  })
+
+  it('persists lifecycle and parentId across service instances', () => {
+    const file = join(dir, 'projects.json')
+    const first = new KanbanHostService(file)
+    first.start()
+    const parent = first.createProject({ title: '主线', workspaceDir: '/w', goal: 'g', lifecycle: 'long-running' })
+    const child = first.createProject({ title: '子项', workspaceDir: '/w', goal: 'g', parentId: parent.id })
+    first.dispose()
+
+    const second = new KanbanHostService(file)
+    second.start()
+    expect(second.getProject(parent.id)?.lifecycle).toBe('long-running')
+    expect(second.getProject(parent.id)?.status).toBe('executing')
+    expect(second.getProject(child.id)?.parentId).toBe(parent.id)
   })
 })

@@ -43,6 +43,19 @@ describe('storage', () => {
     expect(loadState(file)).toEqual(state)
   })
 
+  it('loads a legacy ledger without lifecycle/parentId unchanged', () => {
+    // Pre-lifecycle ledgers have neither field; absence must mean one-shot.
+    const file = join(dir, 'projects.json')
+    const legacy = sampleProject()
+    expect('lifecycle' in legacy).toBe(false)
+    expect('parentId' in legacy).toBe(false)
+    writeFileSync(file, JSON.stringify({ format: 1, revision: 1, projects: [legacy] }), 'utf8')
+    const state = loadState(file)
+    expect(state.projects[0]).toEqual(legacy)
+    expect(state.projects[0]?.lifecycle).toBeUndefined()
+    expect(state.projects[0]?.parentId).toBeUndefined()
+  })
+
   it('leaves no temp file behind after a save', () => {
     const file = join(dir, 'projects.json')
     saveState(file, { format: 1, revision: 1, projects: [] })

@@ -153,6 +153,35 @@ describe('Task detail view', () => {
     unmount()
   })
 
+  it('renders long multi-line Q&A in the detail view in full (dk-detail-qa, no truncation class)', async () => {
+    const longQuestion = '第一行问题：数据源是什么？'.repeat(5)
+    const longAnswer = ['第一行回答：本地 CSV', '第二行回答：增量同步', '第三行回答：每小时一次'].join('\n')
+    const transport = new FakeTransport()
+    transport.stateValue = {
+      revision: 1,
+      projects: [],
+      tasks: [task({ question: longQuestion, answer: longAnswer })],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    const unmount = await renderBoard(store)
+    await act(async () => { scopedButton('明确需求', '详情').click() })
+
+    const qaSection = [...container.querySelectorAll<HTMLElement>('.dk-detail-section')]
+      .find(section => section.textContent?.includes('澄清问答'))!
+    expect(qaSection).toBeDefined()
+
+    const qaParagraphs = [...qaSection.querySelectorAll<HTMLElement>('p.dk-detail-qa')]
+    expect(qaParagraphs).toHaveLength(2)
+    // Full text present — no truncation marker, every line kept.
+    expect(qaParagraphs[0].textContent).toBe(`❓ ${longQuestion}`)
+    expect(qaParagraphs[1].textContent).toBe(`✅ ${longAnswer}`)
+    expect(qaSection.textContent).not.toContain('…')
+    // The detail view must not reuse the card's two-line clamp class.
+    expect(qaSection.querySelector('.dk-card-goal')).toBeNull()
+    unmount()
+  })
+
   it('renders the basic-info section: titlePath, kind/status badges, timestamps, project title, and the session entry', async () => {
     const transport = new FakeTransport()
     transport.stateValue = { revision: 1, projects: [project()], tasks: [task()] }

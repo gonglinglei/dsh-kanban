@@ -26,6 +26,10 @@ html[data-dsh-kanban-active] [class*='centerCol'] > :not([data-dsh-kanban-view])
   margin: 0; padding: 8px 12px; font-size: 12px; color: #b3261e;
   background: #fdecea; border-bottom: 1px solid #f5c6c2; flex: 0 0 auto;
 }
+[data-dsh-kanban-view] .dk-banner {
+  margin: 0; padding: 8px 12px; font-size: 12px; color: #7a5b00;
+  background: #fff7e0; border-bottom: 1px solid #efe0a8; flex: 0 0 auto;
+}
 [data-dsh-kanban-view] .dk-columns {
   display: flex; gap: 12px; padding: 16px 20px; overflow-x: auto;
   flex: 1 1 auto; align-items: flex-start;
@@ -49,9 +53,15 @@ html[data-dsh-kanban-active] [class*='centerCol'] > :not([data-dsh-kanban-view])
   border-radius: 8px; padding: 10px;
 }
 [data-dsh-kanban-view] .dk-card-title { margin: 0; font-size: 13px; font-weight: 600; word-break: break-all; }
+[data-dsh-kanban-view] .dk-card-title .dk-kind-badge { margin-right: 6px; font-weight: 400; }
+[data-dsh-kanban-view] .dk-card-parent { margin: 0; font-size: 11px; color: var(--dsw-alias-text-tertiary, #999); }
 [data-dsh-kanban-view] .dk-card-goal {
   margin: 0; font-size: 12px; color: var(--dsw-alias-text-secondary, #666);
   word-break: break-all; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+[data-dsh-kanban-view] .dk-detail-qa {
+  margin: 0; font-size: 12px; color: var(--dsw-alias-text-secondary, #666);
+  word-break: break-all; white-space: pre-wrap;
 }
 [data-dsh-kanban-view] .dk-card-meta { font-size: 11px; color: var(--dsw-alias-text-tertiary, #999); }
 [data-dsh-kanban-view] .dk-card-path { margin: 0; font-size: 11px; color: var(--dsw-alias-text-tertiary, #999); }
@@ -87,10 +97,12 @@ html[data-dsh-kanban-active] [class*='centerCol'] > :not([data-dsh-kanban-view])
 }
 [data-dsh-kanban-view] .dk-field { display: flex; flex-direction: column; gap: 4px; }
 [data-dsh-kanban-view] .dk-field label { font-size: 12px; font-weight: 600; }
-[data-dsh-kanban-view] .dk-field input {
+[data-dsh-kanban-view] .dk-field input, [data-dsh-kanban-view] .dk-field select {
   font: inherit; font-size: 13px; border: 1px solid var(--dsw-alias-border, #d0d0d0);
   border-radius: 6px; padding: 6px 8px; background: var(--dsw-alias-bg-base, #fff); color: inherit;
 }
+[data-dsh-kanban-view] .dk-radio-row { display: flex; gap: 14px; font-size: 12px; }
+[data-dsh-kanban-view] .dk-radio-row label { display: flex; align-items: center; gap: 4px; font-weight: 400; cursor: pointer; }
 [data-dsh-kanban-view] .dk-modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
 [data-dsh-kanban-view] .dk-modal-error { margin: 0; font-size: 12px; color: #b3261e; }
 [data-dsh-kanban-view] .dk-btn:disabled { opacity: 0.5; cursor: not-allowed; }

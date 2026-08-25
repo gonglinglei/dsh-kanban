@@ -11,6 +11,7 @@
 import { useEffect, useSyncExternalStore, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { Actor, Project, ProjectStatus, TaskKind, TaskNode } from '../protocol.ts'
+import { CAPABILITY_LONG_RUNNING_PROJECTS } from '../protocol.ts'
 import { rememberWorkspaceDir } from './last-workspace-dir.ts'
 import type { BoardStore } from './store.ts'
 import { closeBoard } from './view-state.ts'
@@ -112,6 +113,11 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
   // detail / columns instead of going blank.
   const detailTask = detailTaskId === null ? undefined : snapshot.tasks.find(task => task.id === detailTaskId)
 
+  // Version-mismatch guard: an old host silently drops the lifecycle field
+  // on create-project, so the client must not offer「长期执行中的项目」
+  // unless the running host declares the capability. Absent = too old.
+  const supportsLongRunning = snapshot.capabilities?.includes(CAPABILITY_LONG_RUNNING_PROJECTS) ?? false
+
   if (detailTask !== undefined) {
     return (
       <div className="dk-board">
@@ -141,6 +147,9 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
             </div>
           </header>
           {error !== null && <p className="dk-error">host 通信失败：{error}</p>}
+          {!supportsLongRunning && (
+            <p className="dk-banner">看板 host 版本过旧，不支持长期项目；请重启 DSH 后刷新页面</p>
+          )}
           <div className="dk-columns">
             {COLUMNS.map(column => {
               const projects = snapshot.projects.filter(project => project.status === column.status)
@@ -156,6 +165,7 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
                     <ProjectCard
                       key={project.id}
                       project={project}
+                      parentTitle={project.parentId === undefined ? undefined : snapshot.projects.find(parent => parent.id === project.parentId)?.title}
                       taskCount={snapshot.tasks.filter(task => task.projectId === project.id).length}
                       rejecting={rejectingId === project.id}
                       onToggleReject={() => { setRejectingId(rejectingId === project.id ? null : project.id) }}
@@ -184,8 +194,11 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
         <ProjectDetail
           project={detailProject}
           tasks={snapshot.tasks.filter(task => task.projectId === detailProject.id)}
+          parentTitle={detailProject.parentId === undefined ? undefined : snapshot.projects.find(parent => parent.id === detailProject.parentId)?.title}
+          childProjects={snapshot.projects.filter(candidate => candidate.parentId === detailProject.id)}
           store={store}
           onBack={() => { setDetailId(null) }}
+          onOpenProjectDetail={projectId => { setDetailId(projectId) }}
           onAction={action => {
             void store.apply(action)
             // The project is gone after a delete; fall back to the board.
@@ -198,6 +211,10 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
       {creating && (
         <NewProjectModal
           getDefaultWorkspaceDir={getDefaultWorkspaceDir}
+          supportsLongRunning={supportsLongRunning}
+          parents={snapshot.projects
+            .filter(project => project.lifecycle === 'long-running')
+            .map(project => ({ id: project.id, title: project.title }))}
           onCancel={() => { setCreating(false) }}
           onCreate={input => {
             setCreating(false)
@@ -216,6 +233,8 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
 
 interface ProjectCardProps {
   project: Project
+  /** Resolved title of the parent long-running project (undefined when unaffiliated or the parent is gone). */
+  parentTitle?: string
   taskCount: number
   rejecting: boolean
   onToggleReject(): void
@@ -224,7 +243,7 @@ interface ProjectCardProps {
   onOpenDetail(): void
 }
 
-function ProjectCard({ project, taskCount, rejecting, onToggleReject, onAction, onOpenSession, onOpenDetail }: ProjectCardProps): JSX.Element {
+function ProjectCard({ project, parentTitle, taskCount, rejecting, onToggleReject, onAction, onOpenSession, onOpenDetail }: ProjectCardProps): JSX.Element {
   const { openError, open } = useOpenSession(onOpenSession)
   const handleOpenSession = (): void => { open(project.sessionId!) }
   const sessionChip = project.sessionId !== undefined
@@ -233,8 +252,14 @@ function ProjectCard({ project, taskCount, rejecting, onToggleReject, onAction, 
 
   return (
     <article className="dk-card">
-      <h3 className="dk-card-title">{project.title}</h3>
+      <h3 className="dk-card-title">
+        {project.lifecycle === 'long-running' && <span className="dk-kind-badge">长期</span>}
+        {project.title}
+      </h3>
       <p className="dk-card-goal">{project.goal}</p>
+      {project.parentId !== undefined && (
+        <p className="dk-card-parent">隶属于 {parentTitle ?? '（父项目已删除）'}</p>
+      )}
       <div className="dk-card-meta">
         {project.sessionId?.slice(0, 13) ?? '无会话'}
         {taskCount > 0 && <> · 子任务 {taskCount}</>}
@@ -341,10 +366,16 @@ function TaskCard({ task, projectTitle, waitingFor, onAction, onOpenSession, onO
 interface ProjectDetailProps {
   project: Project
   tasks: TaskNode[]
+  /** Resolved title of the parent long-running project (undefined when unaffiliated or the parent is gone). */
+  parentTitle?: string
+  /** Projects affiliated to this one (only meaningful for a long-running project). */
+  childProjects: Project[]
   store: BoardStore
   onBack(): void
   onAction(action: Parameters<BoardStore['apply']>[0]): void
   onOpenSession(sessionId: string): void
+  /** Cross-navigation: a child project row opens that project's detail. */
+  onOpenProjectDetail(projectId: string): void
   /** Cross-navigation: a task row in the「子任务」section opens the task detail. */
   onOpenTaskDetail(taskId: string): void
 }
@@ -355,7 +386,7 @@ interface ProjectDetailProps {
  * plan preview (fetched on demand through the /kanban/file route), task
  * leaves, transition history, and the same action set as the card.
  */
-function ProjectDetail({ project, tasks, store, onBack, onAction, onOpenSession, onOpenTaskDetail }: ProjectDetailProps): JSX.Element {
+function ProjectDetail({ project, tasks, parentTitle, childProjects, store, onBack, onAction, onOpenSession, onOpenProjectDetail, onOpenTaskDetail }: ProjectDetailProps): JSX.Element {
   const [rejecting, setRejecting] = useState(false)
   const { openError, open } = useOpenSession(onOpenSession)
   const [plan, setPlan] = useState<{ state: 'loading' | 'loaded' | 'error'; text?: string; error?: string } | null>(null)
@@ -390,6 +421,12 @@ function ProjectDetail({ project, tasks, store, onBack, onAction, onOpenSession,
           <h3 className="dk-detail-heading">基本信息</h3>
           <dl className="dk-detail-grid">
             <dt>状态</dt><dd><span className="dk-kind-badge">{STATUS_LABELS[project.status]}</span></dd>
+            <dt>生命周期</dt><dd>{project.lifecycle === 'long-running' ? '长期执行中' : '一次性'}</dd>
+            {project.parentId !== undefined && (
+              <>
+                <dt>所属长期项目</dt><dd>{parentTitle ?? '（父项目已删除）'}</dd>
+              </>
+            )}
             <dt>目标</dt><dd>{project.goal}</dd>
             <dt>工作目录</dt><dd><code>{project.workspaceDir}</code></dd>
             <dt>创建时间</dt><dd>{formatTime(project.createdAt)}</dd>
@@ -439,6 +476,23 @@ function ProjectDetail({ project, tasks, store, onBack, onAction, onOpenSession,
             </div>
           ))}
         </section>
+
+        {project.lifecycle === 'long-running' && (
+          <section className="dk-detail-section">
+            <h3 className="dk-detail-heading">名下子项目({childProjects.length})</h3>
+            {childProjects.length === 0 ? <p className="dk-empty">尚无子项目</p> : childProjects.map(child => (
+              <div className="dk-detail-task" key={child.id}>
+                <div className="dk-card-meta">
+                  <span className="dk-kind-badge">{STATUS_LABELS[child.status]}</span>
+                </div>
+                <p className="dk-detail-task-path">{child.title}</p>
+                <div className="dk-card-actions">
+                  <button className="dk-btn dk-btn-ghost" onClick={() => { onOpenProjectDetail(child.id) }}>详情</button>
+                </div>
+              </div>
+            ))}
+          </section>
+        )}
 
         <section className="dk-detail-section">
           <h3 className="dk-detail-heading">流转历史</h3>
@@ -562,10 +616,10 @@ function TaskDetail({ task, projectTitle, waitingFor, store, backLabel, onBack, 
           <section className="dk-detail-section">
             <h3 className="dk-detail-heading">澄清问答</h3>
             {task.question !== undefined
-              ? <p className="dk-card-goal">❓ {task.question}</p>
+              ? <p className="dk-detail-qa">❓ {task.question}</p>
               : <p className="dk-empty">尚无问题</p>}
             {task.answer !== undefined
-              ? <p className="dk-card-goal">✅ {task.answer}</p>
+              ? <p className="dk-detail-qa">✅ {task.answer}</p>
               : <p className="dk-empty">尚未回答</p>}
           </section>
         )}
@@ -740,10 +794,29 @@ export interface NewProjectInput {
   title: string
   workspaceDir: string
   goal: string
+  /** 'long-running' creates a long-running board container; absent means one-shot. */
+  lifecycle?: 'long-running'
+  /** Optional affiliation to an existing long-running project (one-shot only). */
+  parentId?: string
 }
 
-function NewProjectModal({ getDefaultWorkspaceDir, onCancel, onCreate }: {
+/** One option of the modal's「关联长期项目」select (id + display title). */
+export interface ParentOption {
+  id: string
+  title: string
+}
+
+function NewProjectModal({ getDefaultWorkspaceDir, supportsLongRunning, parents, onCancel, onCreate }: {
   getDefaultWorkspaceDir(): string
+  /**
+   * Whether the running host declared the long-running-projects capability.
+   * When false the「项目类型」radio and the affiliation select are hidden so
+   * the form can only submit a plain one-shot create — exactly what an old
+   * host understands (its parser silently drops unknown fields).
+   */
+  supportsLongRunning: boolean
+  /** The snapshot's long-running projects, offered as affiliation targets. */
+  parents: ParentOption[]
   onCancel(): void
   onCreate(input: NewProjectInput): void
 }): JSX.Element {
@@ -752,6 +825,8 @@ function NewProjectModal({ getDefaultWorkspaceDir, onCancel, onCreate }: {
   const [title, setTitle] = useState('')
   const [workspaceDir, setWorkspaceDir] = useState(() => getDefaultWorkspaceDir())
   const [goal, setGoal] = useState('')
+  const [longRunning, setLongRunning] = useState(false)
+  const [parentId, setParentId] = useState('')
   const [submitError, setSubmitError] = useState<string | null>(null)
   const valid = title.trim() !== '' && workspaceDir.trim() !== '' && goal.trim() !== ''
 
@@ -762,13 +837,36 @@ function NewProjectModal({ getDefaultWorkspaceDir, onCancel, onCreate }: {
       setSubmitError('请填写项目名称、工作目录和目标')
       return
     }
-    onCreate({ title: title.trim(), workspaceDir: workspaceDir.trim(), goal: goal.trim() })
+    // Omit the optional keys entirely when unset so the action envelope
+    // stays byte-identical to a pre-feature one-shot create.
+    onCreate({
+      title: title.trim(),
+      workspaceDir: workspaceDir.trim(),
+      goal: goal.trim(),
+      ...(longRunning ? { lifecycle: 'long-running' as const } : {}),
+      ...(!longRunning && parentId !== '' ? { parentId } : {}),
+    })
   }
 
   return (
     <div className="dk-modal-overlay" onClick={onCancel}>
       <div className="dk-modal" onClick={event => { event.stopPropagation() }}>
         <h3 style={{ margin: 0, fontSize: '15px' }}>新建项目</h3>
+        {supportsLongRunning && (
+          <div className="dk-field">
+            <label>项目类型</label>
+            <div className="dk-radio-row">
+              <label>
+                <input type="radio" name="dk-lifecycle" checked={!longRunning} onChange={() => { setLongRunning(false); setSubmitError(null) }} />
+                一次性项目
+              </label>
+              <label>
+                <input type="radio" name="dk-lifecycle" checked={longRunning} onChange={() => { setLongRunning(true); setSubmitError(null) }} />
+                长期执行中的项目
+              </label>
+            </div>
+          </div>
+        )}
         <div className="dk-field">
           <label htmlFor="dk-title">项目名称</label>
           <input id="dk-title" value={title} placeholder="例如：重构看板后端" onChange={event => { setTitle(event.target.value); setSubmitError(null) }} />
@@ -781,10 +879,19 @@ function NewProjectModal({ getDefaultWorkspaceDir, onCancel, onCreate }: {
           <label htmlFor="dk-goal">项目目标（一句话）</label>
           <input id="dk-goal" value={goal} placeholder="例如：把任务看板的后端迁移到 SQLite" onChange={event => { setGoal(event.target.value); setSubmitError(null) }} />
         </div>
+        {supportsLongRunning && !longRunning && (
+          <div className="dk-field">
+            <label htmlFor="dk-parent">关联长期项目（可选）</label>
+            <select id="dk-parent" value={parentId} onChange={event => { setParentId(event.target.value); setSubmitError(null) }}>
+              <option value="">不关联</option>
+              {parents.map(parent => <option key={parent.id} value={parent.id}>{parent.title}</option>)}
+            </select>
+          </div>
+        )}
         {submitError !== null && <p className="dk-modal-error">{submitError}</p>}
         <div className="dk-modal-actions">
           <button className="dk-btn" onClick={onCancel}>取消</button>
-          <button className="dk-btn dk-btn-primary" onClick={submit}>创建并开始设计</button>
+          <button className="dk-btn dk-btn-primary" onClick={submit}>{longRunning ? '创建长期项目' : '创建并开始设计'}</button>
         </div>
       </div>
     </div>

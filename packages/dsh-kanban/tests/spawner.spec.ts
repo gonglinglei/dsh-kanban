@@ -285,4 +285,66 @@ describe('KanbanSpawner', () => {
     expect(service.getProject(projectA.id)?.planPath).not.toBe(service.getProject(projectB.id)?.planPath)
     expect(readFileSync(planPathFor(projectB), 'utf8')).toBe('# B 的方案')
   })
+
+  it('a long-running project entering executing never spawns any session', async () => {
+    const service = makeService()
+    const api = new FakeApi()
+    const spawner = new KanbanSpawner(service, api)
+    spawner.start()
+    const project = service.createProject({ title: '主线', workspaceDir: dir, goal: 'g', lifecycle: 'long-running' })
+    await flush()
+    expect(service.getProject(project.id)?.status).toBe('executing')
+    expect(api.sessions.created).toHaveLength(0)
+    expect(api.sessions.prompted).toHaveLength(0)
+    expect(service.getProject(project.id)?.sessionId).toBeUndefined()
+  })
+
+  it('host-restart recovery never spawns a session for a long-running project either', async () => {
+    // The project was persisted mid-executing; the restart refire must hit the same guard.
+    const service = makeService()
+    const project = service.createProject({ title: '主线', workspaceDir: dir, goal: 'g', lifecycle: 'long-running' })
+    const api = new FakeApi()
+    const spawner = new KanbanSpawner(service, api)
+    spawner.start() // refirePhaseHooks fires onEnterExecuting → guarded
+    await flush()
+    expect(api.sessions.created).toHaveLength(0)
+    expect(api.sessions.prompted).toHaveLength(0)
+    expect(service.getProject(project.id)?.status).toBe('executing')
+  })
+
+  it('a child project\'s execute prompt carries the parent long-running project context', async () => {
+    const service = makeService()
+    const api = new FakeApi()
+    const spawner = new KanbanSpawner(service, api)
+    spawner.start()
+    const parent = service.createProject({ title: '主线建设', workspaceDir: dir, goal: '持续演进', lifecycle: 'long-running' })
+    const child = service.createProject({ title: '子项', workspaceDir: dir, goal: 'g', parentId: parent.id })
+    await flush(1)
+
+    // Design done → human confirm → execution session spawns with the parent line.
+    writeFileSync(planPathFor(child), '# 方案', 'utf8')
+    api.sessions.summaries.set('sess-1', { sessionId: 'sess-1', running: false })
+    api.sessions.histories.set('sess-1', [turnEnd(Date.now() + 1)])
+    await flush()
+    service.confirmPlan(child.id)
+    await flush(1)
+    expect(api.sessions.created).toHaveLength(2)
+    expect(api.sessions.prompted.at(-1)?.text).toContain('本项目隶属于长期项目：主线建设 — 持续演进')
+  })
+
+  it('an unaffiliated project\'s execute prompt has no parent context line', async () => {
+    const service = makeService()
+    const api = new FakeApi()
+    const spawner = new KanbanSpawner(service, api)
+    spawner.start()
+    const project = service.createProject({ title: 't', workspaceDir: dir, goal: 'g' })
+    await flush(1)
+    writeFileSync(planPathFor(project), '# 方案', 'utf8')
+    api.sessions.summaries.set('sess-1', { sessionId: 'sess-1', running: false })
+    api.sessions.histories.set('sess-1', [turnEnd(Date.now() + 1)])
+    await flush()
+    service.confirmPlan(project.id)
+    await flush(1)
+    expect(api.sessions.prompted.at(-1)?.text).not.toContain('隶属于长期项目')
+  })
 })

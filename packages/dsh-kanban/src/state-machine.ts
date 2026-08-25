@@ -3,6 +3,7 @@
  *
  * MVP machine (flat per project):
  *   backlog → designing → awaiting-review → executing → done
+ *   backlog → executing            (system: long-running project creation)
  *   awaiting-review → designing  (human rejection, with feedback)
  *   any → blocked                (stale timer, or human)
  *   any → any                    (human override — the human is always in charge)
@@ -35,6 +36,8 @@ export function transitionAllowed(from: ProjectStatus, to: ProjectStatus, actor:
     // The host drives creation into design, phase outcomes, artifact
     // verification (research leaves: awaiting-review -> done), and staleness.
     if (from === 'backlog' && to === 'designing') return true
+    // Long-running projects enter executing directly on creation.
+    if (from === 'backlog' && to === 'executing') return true
     if (from === 'designing' && to === 'awaiting-review') return true
     if (from === 'awaiting-review' && to === 'done') return true
     if (from === 'executing' && to === 'done') return true

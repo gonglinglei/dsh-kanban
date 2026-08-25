@@ -244,4 +244,24 @@ describe('KanbanSpawner task leaves', () => {
     service.confirmTask(projectId, design.id)
     expect(service.getProject(projectId)?.status).toBe('done')
   })
+
+  it('an affiliated child project\'s execute-leaf prompt carries the parent long-running project context', async () => {
+    const service = makeService()
+    const api = new FakeApi()
+    const spawner = new KanbanSpawner(service, api)
+    spawner.start()
+    const parent = service.createProject({ title: '主线建设', workspaceDir: dir, goal: '持续演进', lifecycle: 'long-running' })
+    const project = service.createProject({ title: '子项', workspaceDir: dir, goal: 'g', parentId: parent.id })
+    mkdirSync(projectDir(project), { recursive: true })
+    writeFileSync(decompositionPathFor(project), JSON.stringify({
+      decomposed: true,
+      tasks: [{ title: '实现功能', kind: 'execute' }],
+    }), 'utf8')
+    service.confirmPlan(project.id)
+    await flush()
+
+    const execute = service.projectTasks(project.id).find(task => task.kind === 'execute')!
+    const prompted = api.sessions.prompted.find(entry => entry.sessionId === execute.sessionId)
+    expect(prompted?.text).toContain('本项目隶属于长期项目：主线建设 — 持续演进')
+  })
 })

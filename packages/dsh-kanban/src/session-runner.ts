@@ -149,14 +149,26 @@ export function designPrompt(project: Project): string {
   ].join('\n')
 }
 
+/** The parent long-running project's identity, injected into execute prompts. */
+export interface ParentProjectContext {
+  title: string
+  goal: string
+}
+
+/** The one-line affiliation context appended to execute prompts. */
+function parentContextLine(parent: ParentProjectContext | undefined): string[] {
+  return parent === undefined ? [] : [`本项目隶属于长期项目：${parent.title} — ${parent.goal}`]
+}
+
 /** The execution agent's task prompt: read the confirmed plan and execute it. */
-export function executePrompt(project: Project): string {
+export function executePrompt(project: Project, parent?: ParentProjectContext): string {
   return [
     '你是 dsh-kanban 的执行 agent。方案已经人工确认，请执行。',
     '',
     `项目：${project.title}`,
     `工作目录：${project.workspaceDir}`,
     `方案文件：${planPathHint(project)}`,
+    ...parentContextLine(parent),
     '',
     '要求：按照方案逐步执行，全部完成后结束你的回合。',
   ].join('\n')
@@ -218,7 +230,12 @@ export function designTaskPrompt(task: TaskNode, project: Project): string {
 }
 
 /** The execute leaf prompt: run this leaf with the plan and clarification context. */
-export function executeTaskPrompt(task: TaskNode, project: Project, clarifications: ReadonlyArray<{ question: string; answer: string }>): string {
+export function executeTaskPrompt(
+  task: TaskNode,
+  project: Project,
+  clarifications: ReadonlyArray<{ question: string; answer: string }>,
+  parent?: ParentProjectContext,
+): string {
   const lines = [
     '你是 dsh-kanban 的执行 agent。请执行以下子任务。',
     '',
@@ -226,6 +243,7 @@ export function executeTaskPrompt(task: TaskNode, project: Project, clarificatio
     `所属项目：${project.title}`,
     `工作目录：${project.workspaceDir}`,
     `项目方案：${planPathHint(project)}`,
+    ...parentContextLine(parent),
   ]
   if (clarifications.length > 0) {
     lines.push('', '已确认的目标澄清记录：')
@@ -257,8 +275,8 @@ export class KanbanSessionRunner {
   }
 
   /** Create + rename + prompt a fresh execution session; returns the session id. */
-  async launchExecute(project: Project): Promise<string> {
-    return this.launch(project, executePrompt(project), `${project.title}·执行`)
+  async launchExecute(project: Project, parent?: ParentProjectContext): Promise<string> {
+    return this.launch(project, executePrompt(project, parent), `${project.title}·执行`)
   }
 
   /** Create + rename + prompt a research leaf session; returns the session id. */
@@ -272,8 +290,13 @@ export class KanbanSessionRunner {
   }
 
   /** Create + rename + prompt an execute leaf session; returns the session id. */
-  async launchExecuteTask(task: TaskNode, project: Project, clarifications: ReadonlyArray<{ question: string; answer: string }>): Promise<string> {
-    return this.launch(project, executeTaskPrompt(task, project, clarifications), `${task.titlePath.split(' > ').at(-1)}·执行`)
+  async launchExecuteTask(
+    task: TaskNode,
+    project: Project,
+    clarifications: ReadonlyArray<{ question: string; answer: string }>,
+    parent?: ParentProjectContext,
+  ): Promise<string> {
+    return this.launch(project, executeTaskPrompt(task, project, clarifications, parent), `${task.titlePath.split(' > ').at(-1)}·执行`)
   }
 
   /** Prompt the project's existing design session with the rejection feedback. */
