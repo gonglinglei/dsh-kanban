@@ -86,7 +86,14 @@ function button(text: string): HTMLButtonElement {
 }
 
 async function openDetail(): Promise<void> {
-  await act(async () => { button('详情').click() })
+  // Task cards also carry a「详情」entry now; scope to the project card,
+  // which (unlike a task card) has no kind badge.
+  const card = [...container.querySelectorAll<HTMLElement>('.dk-card')]
+    .find(candidate => candidate.querySelector('.dk-kind-badge') === null)
+  expect(card, 'a project card must exist').toBeDefined()
+  const found = [...card!.querySelectorAll('button')].find(candidate => candidate.textContent === '详情')
+  expect(found, 'the project card「详情」button must exist').toBeDefined()
+  await act(async () => { found!.click() })
 }
 
 describe('Project detail view', () => {

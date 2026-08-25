@@ -1,9 +1,12 @@
 /**
  * The kanban board view: six columns, project cards with phase actions
  * (confirm / reject with feedback / re-design / delete), a full-screen
- * project detail view switched inside the board container, the new-project
- * modal, and a live session-open affordance. Reads the BoardStore through
- * useSyncExternalStore; every mutation goes through store.apply.
+ * project detail view switched inside the board container, a full-screen
+ * task detail view (same switch pattern, stacked above the project detail
+ * so the clarify Q&A and the task-level history stay reachable from every
+ * status — including done), the new-project modal, and a live session-open
+ * affordance. Reads the BoardStore through useSyncExternalStore; every
+ * mutation goes through store.apply.
  */
 import { useEffect, useSyncExternalStore, useState } from 'react'
 import type { ReactNode } from 'react'
@@ -83,6 +86,14 @@ function useOpenSession(onOpenSession: (sessionId: string) => void): { openError
   return { openError, open }
 }
 
+/** Titles of a task's not-yet-done dependencies (card waiting line and detail dependencies section). */
+function waitingForTitles(task: TaskNode, tasks: TaskNode[]): string[] {
+  return task.dependencies
+    .map(id => tasks.find(candidate => candidate.id === id))
+    .filter((candidate): candidate is TaskNode => candidate !== undefined && candidate.status !== 'done')
+    .map(candidate => candidate.titlePath.split(' > ').at(-1) ?? candidate.titlePath)
+}
+
 /** The board view (MVP). */
 export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps): JSX.Element {
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot)
@@ -90,7 +101,32 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
   const [creating, setCreating] = useState(false)
   const [rejectingId, setRejectingId] = useState<string | null>(null)
   const [detailId, setDetailId] = useState<string | null>(null)
+  // detailTaskId stacks on top of detailId: opening a task detail from the
+  // project detail keeps detailId set, so「返回」is always just
+  // setDetailTaskId(null) and lands back on the project detail.
+  const [detailTaskId, setDetailTaskId] = useState<string | null>(null)
   const detailProject = detailId === null ? undefined : snapshot.projects.find(project => project.id === detailId)
+  // Resolves to undefined when the task (or its whole project) disappeared
+  // from the snapshot; the render chain below then falls back to the project
+  // detail / columns instead of going blank.
+  const detailTask = detailTaskId === null ? undefined : snapshot.tasks.find(task => task.id === detailTaskId)
+
+  if (detailTask !== undefined) {
+    return (
+      <div className="dk-board">
+        <TaskDetail
+          task={detailTask}
+          projectTitle={snapshot.projects.find(project => project.id === detailTask.projectId)?.title ?? ''}
+          waitingFor={waitingForTitles(detailTask, snapshot.tasks)}
+          store={store}
+          backLabel={detailId === null ? '返回看板' : '返回项目'}
+          onBack={() => { setDetailTaskId(null) }}
+          onAction={action => { void store.apply(action) }}
+          onOpenSession={openSession}
+        />
+      </div>
+    )
+  }
 
   return (
     <div className="dk-board">
@@ -132,12 +168,10 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
                       key={task.id}
                       task={task}
                       projectTitle={snapshot.projects.find(project => project.id === task.projectId)?.title ?? ''}
-                      waitingFor={task.dependencies
-                        .map(id => snapshot.tasks.find(candidate => candidate.id === id))
-                        .filter((candidate): candidate is TaskNode => candidate !== undefined && candidate.status !== 'done')
-                        .map(candidate => candidate.titlePath.split(' > ').at(-1) ?? candidate.titlePath)}
+                      waitingFor={waitingForTitles(task, snapshot.tasks)}
                       onAction={action => { void store.apply(action) }}
                       onOpenSession={openSession}
+                      onOpenDetail={() => { setDetailTaskId(task.id) }}
                     />
                   ))}
                 </section>
@@ -157,6 +191,7 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
             if (action.kind === 'delete-project') setDetailId(null)
           }}
           onOpenSession={openSession}
+          onOpenTaskDetail={taskId => { setDetailTaskId(taskId) }}
         />
       )}
       {creating && (
@@ -234,10 +269,11 @@ interface TaskCardProps {
   waitingFor: string[]
   onAction(action: Parameters<BoardStore['apply']>[0]): void
   onOpenSession(sessionId: string): void
+  onOpenDetail(): void
 }
 
 /** One decomposed task leaf: level-indented title, kind badge, and kind-specific actions. */
-function TaskCard({ task, projectTitle, waitingFor, onAction, onOpenSession }: TaskCardProps): JSX.Element {
+function TaskCard({ task, projectTitle, waitingFor, onAction, onOpenSession, onOpenDetail }: TaskCardProps): JSX.Element {
   const segments = task.titlePath.split(' > ')
   const level = segments.length - 1
   const [answerDraft, setAnswerDraft] = useState('')
@@ -289,6 +325,7 @@ function TaskCard({ task, projectTitle, waitingFor, onAction, onOpenSession }: T
         {task.sessionId !== undefined && (task.status === 'designing' || task.status === 'executing' || task.status === 'done') && (
           <button className="dk-btn dk-btn-ghost" onClick={handleOpenSession}>打开会话</button>
         )}
+        <button className="dk-btn dk-btn-ghost" onClick={onOpenDetail}>详情</button>
       </div>
       {openError !== null && <p className="dk-card-error">无法打开会话：{openError}</p>}
     </article>
@@ -302,6 +339,8 @@ interface ProjectDetailProps {
   onBack(): void
   onAction(action: Parameters<BoardStore['apply']>[0]): void
   onOpenSession(sessionId: string): void
+  /** Cross-navigation: a task row in the「子任务」section opens the task detail. */
+  onOpenTaskDetail(taskId: string): void
 }
 
 /**
@@ -310,7 +349,7 @@ interface ProjectDetailProps {
  * plan preview (fetched on demand through the /kanban/file route), task
  * leaves, transition history, and the same action set as the card.
  */
-function ProjectDetail({ project, tasks, store, onBack, onAction, onOpenSession }: ProjectDetailProps): JSX.Element {
+function ProjectDetail({ project, tasks, store, onBack, onAction, onOpenSession, onOpenTaskDetail }: ProjectDetailProps): JSX.Element {
   const [rejecting, setRejecting] = useState(false)
   const { openError, open } = useOpenSession(onOpenSession)
   const [plan, setPlan] = useState<{ state: 'loading' | 'loaded' | 'error'; text?: string; error?: string } | null>(null)
@@ -388,6 +427,9 @@ function ProjectDetail({ project, tasks, store, onBack, onAction, onOpenSession 
               <p className="dk-detail-task-path">{task.titlePath}</p>
               {task.question !== undefined && <p className="dk-card-goal">❓ {task.question}</p>}
               {task.answer !== undefined && <p className="dk-card-goal">✅ {task.answer}</p>}
+              <div className="dk-card-actions">
+                <button className="dk-btn dk-btn-ghost" onClick={() => { onOpenTaskDetail(task.id) }}>详情</button>
+              </div>
             </div>
           ))}
         </section>
@@ -437,9 +479,170 @@ function ProjectDetail({ project, tasks, store, onBack, onAction, onOpenSession 
   )
 }
 
+interface TaskDetailProps {
+  task: TaskNode
+  projectTitle: string
+  /** Titles of not-yet-done dependencies this leaf is waiting on. */
+  waitingFor: string[]
+  store: BoardStore
+  /**「返回看板」when opened from the columns,「返回项目」when opened from a project detail. */
+  backLabel: string
+  onBack(): void
+  onAction(action: Parameters<BoardStore['apply']>[0]): void
+  onOpenSession(sessionId: string): void
+}
+
+/**
+ * The full-screen task detail view (same in-container switch as
+ * ProjectDetail). Six sections: basic info, the clarify Q&A (visible in
+ * every status — done leaves keep their question/answer as the context
+ * basis for downstream execute leaves), an artifact preview (same
+ * three-state on-demand fetch as the plan preview), pending dependencies,
+ * the task-level transition history, and the same status-specific actions
+ * as the card.
+ */
+function TaskDetail({ task, projectTitle, waitingFor, store, backLabel, onBack, onAction, onOpenSession }: TaskDetailProps): JSX.Element {
+  const [answerDraft, setAnswerDraft] = useState('')
+  const { openError, open } = useOpenSession(onOpenSession)
+  const [artifact, setArtifact] = useState<{ state: 'loading' | 'loaded' | 'error'; text?: string; error?: string } | null>(null)
+  const artifactPath = task.artifactPath
+
+  // Same fetch-on-demand pattern as the project plan preview: the artifact
+  // stays out of the snapshot and rides the /kanban/file route.
+  useEffect(() => {
+    if (artifactPath === undefined) {
+      setArtifact(null)
+      return
+    }
+    let cancelled = false
+    setArtifact({ state: 'loading' })
+    store.readFile(artifactPath).then(
+      text => { if (!cancelled) setArtifact({ state: 'loaded', text }) },
+      (error: unknown) => { if (!cancelled) setArtifact({ state: 'error', error: error instanceof Error ? error.message : String(error) }) },
+    )
+    return () => { cancelled = true }
+  }, [artifactPath, store])
+
+  const handleOpenSession = (): void => { open(task.sessionId!) }
+
+  return (
+    <div className="dk-detail">
+      <header className="dk-header">
+        <h2 className="dk-title">{task.titlePath.split(' > ').at(-1)}</h2>
+        <button className="dk-btn" onClick={onBack}>{backLabel}</button>
+      </header>
+      <div className="dk-detail-body">
+        <section className="dk-detail-section">
+          <h3 className="dk-detail-heading">基本信息</h3>
+          <dl className="dk-detail-grid">
+            <dt>标题路径</dt><dd>{task.titlePath}</dd>
+            <dt>类型</dt><dd><span className="dk-kind-badge">{KIND_LABELS[task.kind]}</span></dd>
+            <dt>状态</dt><dd><span className="dk-kind-badge">{STATUS_LABELS[task.status]}</span></dd>
+            <dt>所属项目</dt><dd>{projectTitle !== '' ? projectTitle : '（项目已删除）'}</dd>
+            <dt>创建时间</dt><dd>{formatTime(task.createdAt)}</dd>
+            <dt>更新时间</dt><dd>{formatTime(task.updatedAt)}</dd>
+            <dt>最近活动</dt><dd>{formatTime(task.lastActivityAt)}</dd>
+            <dt>会话</dt>
+            <dd>
+              {task.sessionId !== undefined
+                ? <button className="dk-btn dk-btn-ghost" onClick={handleOpenSession}>打开会话</button>
+                : '无会话'}
+            </dd>
+          </dl>
+          {openError !== null && <p className="dk-card-error">无法打开会话：{openError}</p>}
+        </section>
+
+        {task.kind === 'clarify' && (
+          <section className="dk-detail-section">
+            <h3 className="dk-detail-heading">澄清问答</h3>
+            {task.question !== undefined
+              ? <p className="dk-card-goal">❓ {task.question}</p>
+              : <p className="dk-empty">尚无问题</p>}
+            {task.answer !== undefined
+              ? <p className="dk-card-goal">✅ {task.answer}</p>
+              : <p className="dk-empty">尚未回答</p>}
+          </section>
+        )}
+
+        <section className="dk-detail-section">
+          <h3 className="dk-detail-heading">产物预览</h3>
+          {artifactPath === undefined ? (
+            <p className="dk-empty">尚无产物</p>
+          ) : artifact === null || artifact.state === 'loading' ? (
+            <p className="dk-empty">加载中…</p>
+          ) : artifact.state === 'error' ? (
+            <p className="dk-card-error">产物读取失败：{artifact.error}</p>
+          ) : (
+            <>
+              <p className="dk-card-path">{artifactPath}</p>
+              <Markdown text={artifact.text ?? ''} />
+            </>
+          )}
+        </section>
+
+        {waitingFor.length > 0 && (
+          <section className="dk-detail-section">
+            <h3 className="dk-detail-heading">依赖</h3>
+            <p className="dk-card-waiting">⏳ 等待依赖完成：{waitingFor.join('、')}</p>
+          </section>
+        )}
+
+        <section className="dk-detail-section">
+          <h3 className="dk-detail-heading">流转历史</h3>
+          {task.history.length === 0 ? <p className="dk-empty">尚无流转记录</p> : (
+            <ol className="dk-detail-history">
+              {[...task.history].reverse().map((entry, index) => (
+                <li key={index}>
+                  <span className="dk-detail-history-time">{formatTime(entry.at)}</span>
+                  <span className="dk-detail-history-actor">{ACTOR_LABELS[entry.actor]}</span>
+                  <span>{STATUS_LABELS[entry.from]} → {STATUS_LABELS[entry.to]}</span>
+                  {entry.note !== undefined && <span className="dk-detail-history-note">{entry.note}</span>}
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
+
+        <section className="dk-detail-section">
+          <h3 className="dk-detail-heading">操作</h3>
+          {task.kind === 'clarify' && task.status === 'awaiting-clarification' && (
+            <div className="dk-reject">
+              <textarea
+                placeholder="回答这个问题（会作为后续执行任务的上下文）"
+                value={answerDraft}
+                onChange={event => { setAnswerDraft(event.target.value) }}
+              />
+              <div className="dk-card-actions">
+                <button
+                  className="dk-btn dk-btn-primary"
+                  disabled={answerDraft.trim() === ''}
+                  onClick={() => {
+                    onAction({ kind: 'answer-clarification', projectId: task.projectId, taskId: task.id, answer: answerDraft.trim() })
+                    setAnswerDraft('')
+                  }}
+                >提交回答</button>
+              </div>
+            </div>
+          )}
+          <div className="dk-card-actions">
+            {task.kind === 'clarify' && task.status === 'awaiting-review' && (
+              <button className="dk-btn dk-btn-primary" onClick={() => { onAction({ kind: 'confirm-task', projectId: task.projectId, taskId: task.id }) }}>确认回答</button>
+            )}
+            {task.kind === 'design' && task.status === 'awaiting-review' && (
+              <button className="dk-btn dk-btn-primary" onClick={() => { onAction({ kind: 'confirm-task', projectId: task.projectId, taskId: task.id }) }}>确认设计</button>
+            )}
+            {task.sessionId !== undefined && (
+              <button className="dk-btn dk-btn-ghost" onClick={handleOpenSession}>打开会话</button>
+            )}
+          </div>
+        </section>
+      </div>
+    </div>
+  )
+}
+
 /** Heading tag per markdown level; downshifted two steps because the view already has h2/h3 chrome. */
 const HEADING_TAGS = ['h4', 'h5', 'h6', 'h6', 'h6', 'h6'] as const
-
 /** Inline subset: `code` and **bold**. Everything else stays literal text. */
 function renderInline(text: string): ReactNode[] {
   const nodes: ReactNode[] = []
