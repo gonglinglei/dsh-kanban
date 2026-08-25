@@ -24,10 +24,12 @@ beforeEach(() => {
   container = document.createElement('div')
   document.body.appendChild(container)
   if (isBoardOpen()) toggleBoard()
+  localStorage.clear()
 })
 
 afterEach(() => {
   document.body.innerHTML = ''
+  localStorage.clear()
 })
 
 function task(overrides: Partial<TaskNode> = {}): TaskNode {
@@ -176,6 +178,49 @@ describe('Board rendering', () => {
       workspaceDir: '/default/dir',
       goal: '做点事',
     }])
+  })
+
+  it('remembers the submitted workspace dir in localStorage after a successful create', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = { revision: 1, projects: [], tasks: [] }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    await renderBoard(store)
+
+    const createButton = [...container.querySelectorAll('button')].find(button => button.textContent?.includes('新建项目'))
+    await act(async () => { createButton!.click() })
+    await act(async () => {
+      typeInto(container.querySelector<HTMLInputElement>('#dk-title')!, '新项目')
+      typeInto(container.querySelector<HTMLInputElement>('#dk-workspace')!, '/path/a')
+      typeInto(container.querySelector<HTMLInputElement>('#dk-goal')!, '做点事')
+    })
+    const submit = [...container.querySelectorAll('button')].find(button => button.textContent === '创建并开始设计')
+    await act(async () => { submit!.click() })
+
+    expect(store.getError()).toBeNull()
+    expect(localStorage.getItem('dsh-kanban:last-workspace-dir')).toBe('/path/a')
+  })
+
+  it('does not remember the workspace dir when the host rejects the create', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = { revision: 1, projects: [], tasks: [] }
+    transport.failAction = true
+    const store = new BoardStore(transport)
+    await store.refresh()
+    await renderBoard(store)
+
+    const createButton = [...container.querySelectorAll('button')].find(button => button.textContent?.includes('新建项目'))
+    await act(async () => { createButton!.click() })
+    await act(async () => {
+      typeInto(container.querySelector<HTMLInputElement>('#dk-title')!, '新项目')
+      typeInto(container.querySelector<HTMLInputElement>('#dk-workspace')!, '/path/bad')
+      typeInto(container.querySelector<HTMLInputElement>('#dk-goal')!, '做点事')
+    })
+    const submit = [...container.querySelectorAll('button')].find(button => button.textContent === '创建并开始设计')
+    await act(async () => { submit!.click() })
+
+    expect(store.getError()).not.toBeNull()
+    expect(localStorage.getItem('dsh-kanban:last-workspace-dir')).toBeNull()
   })
 
   it('submitting an incomplete form shows visible validation feedback and forwards nothing', async () => {

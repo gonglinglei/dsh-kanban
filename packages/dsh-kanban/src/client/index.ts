@@ -14,6 +14,7 @@
 import type { ClientContext, ISessions, IWorkspaces, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
 import { mountBoard } from './board-mount.tsx'
 import { HttpKanbanHostTransport } from './host-api.ts'
+import { defaultWorkspaceDir } from './last-workspace-dir.ts'
 import { mountSidebarEntry } from './sidebar-entry.ts'
 import { BoardStore } from './store.ts'
 import { toggleBoard } from './view-state.ts'
@@ -57,8 +58,10 @@ export function apply(ctx: ClientContext): void {
     sessions.open(sessionId as SessionId)
   }
   // Read the workspace default live (when the modal opens), because the
-  // workspace list may still be pending at apply time.
-  const getDefaultWorkspaceDir = (): string => workspaces.list.getSnapshot().items[0]?.path ?? ''
+  // workspace list may still be pending at apply time. The last submitted
+  // dir (remembered in localStorage) wins over the workspace-list fallback.
+  const getDefaultWorkspaceDir = (): string =>
+    defaultWorkspaceDir(() => workspaces.list.getSnapshot().items[0]?.path ?? '')
 
   const disposers: Array<() => void> = []
   try {

@@ -11,6 +11,7 @@
 import { useEffect, useSyncExternalStore, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { Actor, Project, ProjectStatus, TaskKind, TaskNode } from '../protocol.ts'
+import { rememberWorkspaceDir } from './last-workspace-dir.ts'
 import type { BoardStore } from './store.ts'
 import { closeBoard } from './view-state.ts'
 
@@ -199,8 +200,13 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
           getDefaultWorkspaceDir={getDefaultWorkspaceDir}
           onCancel={() => { setCreating(false) }}
           onCreate={input => {
-            void store.apply({ kind: 'create-project', ...input })
             setCreating(false)
+            void (async () => {
+              await store.apply({ kind: 'create-project', ...input })
+              // apply swallows failures into lastError; a rejected dir is
+              // not worth remembering, so only persist on success.
+              if (store.getError() === null) rememberWorkspaceDir(input.workspaceDir)
+            })()
           }}
         />
       )}
