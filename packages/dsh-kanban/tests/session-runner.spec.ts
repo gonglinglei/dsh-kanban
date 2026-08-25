@@ -13,6 +13,8 @@ import {
   projectDir,
   resumePrompt,
   SessionLaunchError,
+  taskAdditionsPathFor,
+  TASK_ADDITIONS_FILE,
   type KanbanApi,
   type KanbanHistoryEvent,
   type KanbanSessionSummary,
@@ -199,5 +201,23 @@ describe('KanbanSessionRunner', () => {
       project,
       [],
     )).not.toContain('隶属于长期项目')
+  })
+
+  it('execute prompts carry the mid-run split instructions and the additions path', () => {
+    const project = sampleProject({ status: 'executing' })
+    const expectedPath = taskAdditionsPathFor(project)
+    expect(expectedPath).toBe(join(projectDir(project), TASK_ADDITIONS_FILE))
+    // Project-level execute prompt (undecomposed projects).
+    const projectPrompt = executePrompt(project)
+    expect(projectPrompt).toContain(expectedPath)
+    expect(projectPrompt).toContain('不要重复拆分你正在执行的任务本身')
+    // Leaf-level execute prompt (decomposed projects).
+    const leafPrompt = executeTaskPrompt(
+      { id: 't1', projectId: project.id, titlePath: '实现功能', kind: 'execute', status: 'executing', dependencies: [], version: 0, createdAt: 0, updatedAt: 0, lastActivityAt: 0, history: [] },
+      project,
+      [],
+    )
+    expect(leafPrompt).toContain(expectedPath)
+    expect(leafPrompt).toContain('不要重复拆分你正在执行的任务本身')
   })
 })

@@ -31,6 +31,13 @@ export type SpawnResult = { kind: 'launched'; sessionId: string } | { kind: 'res
 export class KanbanSpawner {
   private readonly runner: KanbanSessionRunner
   private readonly launchedAt = new Map<string, number>()
+  /**
+   * Task leaves whose spawn RPC is in flight. A hook-fired spawn (e.g. a
+   * leaf materialized mid-tick by applyTaskAdditions) attaches its session
+   * only after several awaited RPCs; without this guard the same tick's
+   * dependency-release sweep would spawn a duplicate session.
+   */
+  private readonly spawning = new Set<string>()
   private timer: NodeJS.Timeout | undefined
   private pollInFlight = false
   private disposed = false
@@ -75,6 +82,7 @@ export class KanbanSpawner {
       if (this.timer !== undefined) clearInterval(this.timer)
       this.timer = undefined
       this.launchedAt.clear()
+      this.spawning.clear()
     }
   }
 
@@ -102,6 +110,11 @@ export class KanbanSpawner {
     // This guard also covers pollProject (no sessionId → early return) and
     // host-restart refirePhaseHooks.
     if (project.lifecycle === 'long-running') return
+    // Decomposed projects never run a project-level execute session — their
+    // leaves do. This also covers a project whose execution split into new
+    // leaves (noteExecutionSplit detached its session): a host restart must
+    // not spawn a fresh project-level session for it.
+    if (this.service.projectTasks(project.id).length > 0) return
     const result = await this.runPhase(async () => {
       // Host-restart recovery: a run that was already attached to a session
       // continues in that session; only a phase with no session spawns fresh.
@@ -121,45 +134,57 @@ export class KanbanSpawner {
   private async enterTaskDesigning(task: TaskNode): Promise<void> {
     const project = this.service.getProject(task.projectId)
     if (project === undefined) return
+    if (this.spawning.has(task.id)) return
     // Dependency scheduling: spawn only when every declared dependency (and,
     // for execute leaves, every clarification) is done.
     if (!this.dependenciesReady(task)) return
-    const result = await this.runPhase(async () => {
-      // Host-restart recovery: the leaf's own session resumes.
-      if (task.sessionId !== undefined && task.sessionRole === task.kind) {
-        return { kind: 'resumed', sessionId: await this.resumeTask(task, project) }
+    this.spawning.add(task.id)
+    try {
+      const result = await this.runPhase(async () => {
+        // Host-restart recovery: the leaf's own session resumes.
+        if (task.sessionId !== undefined && task.sessionRole === task.kind) {
+          return { kind: 'resumed', sessionId: await this.resumeTask(task, project) }
+        }
+        if (task.kind === 'research') {
+          return { kind: 'launched', sessionId: await this.runner.launchResearch(task, project) }
+        }
+        return { kind: 'launched', sessionId: await this.runner.launchDesignTask(task, project) }
+      })
+      if (result.kind === 'failed') {
+        this.failTask(task, `${task.kind} phase: ${result.error}`)
+        return
       }
-      if (task.kind === 'research') {
-        return { kind: 'launched', sessionId: await this.runner.launchResearch(task, project) }
-      }
-      return { kind: 'launched', sessionId: await this.runner.launchDesignTask(task, project) }
-    })
-    if (result.kind === 'failed') {
-      this.failTask(task, `${task.kind} phase: ${result.error}`)
-      return
+      this.launchedAt.set(result.sessionId, Date.now())
+      if (result.kind === 'launched') this.service.attachTaskSession(task.id, result.sessionId, task.kind === 'research' ? 'research' : 'design')
+    } finally {
+      this.spawning.delete(task.id)
     }
-    this.launchedAt.set(result.sessionId, Date.now())
-    if (result.kind === 'launched') this.service.attachTaskSession(task.id, result.sessionId, task.kind === 'research' ? 'research' : 'design')
   }
 
   private async enterTaskExecuting(task: TaskNode): Promise<void> {
     const project = this.service.getProject(task.projectId)
     if (project === undefined) return
+    if (this.spawning.has(task.id)) return
     // Dependency scheduling: execute leaves spawn only when their declared
     // dependencies and every clarification of the project are done.
     if (!this.dependenciesReady(task)) return
-    const result = await this.runPhase(async () => {
-      if (task.sessionId !== undefined && task.sessionRole === 'execute') {
-        return { kind: 'resumed', sessionId: await this.resumeTask(task, project) }
+    this.spawning.add(task.id)
+    try {
+      const result = await this.runPhase(async () => {
+        if (task.sessionId !== undefined && task.sessionRole === 'execute') {
+          return { kind: 'resumed', sessionId: await this.resumeTask(task, project) }
+        }
+        return { kind: 'launched', sessionId: await this.runner.launchExecuteTask(task, project, this.clarifications(task.projectId), this.parentContext(project)) }
+      })
+      if (result.kind === 'failed') {
+        this.failTask(task, `execution phase: ${result.error}`)
+        return
       }
-      return { kind: 'launched', sessionId: await this.runner.launchExecuteTask(task, project, this.clarifications(task.projectId), this.parentContext(project)) }
-    })
-    if (result.kind === 'failed') {
-      this.failTask(task, `execution phase: ${result.error}`)
-      return
+      this.launchedAt.set(result.sessionId, Date.now())
+      if (result.kind === 'launched') this.service.attachTaskSession(task.id, result.sessionId, 'execute')
+    } finally {
+      this.spawning.delete(task.id)
     }
-    this.launchedAt.set(result.sessionId, Date.now())
-    if (result.kind === 'launched') this.service.attachTaskSession(task.id, result.sessionId, 'execute')
   }
 
   /** Continue a task leaf's own session after a host restart. */
@@ -275,12 +300,37 @@ export class KanbanSpawner {
           }
           this.service.reportDesignDone(project.id, planPath, 'system')
         } else {
-          this.service.reportExecuteDone(project.id, 'system')
+          this.settleProjectExecute(project)
         }
       } catch {
         // The phase may have moved concurrently; the board is authoritative.
       }
     })
+  }
+
+  /**
+   * Project-level execute turn ended. Consume any task-additions request
+   * FIRST: when the run split into new leaves, the project stays executing
+   * (its session is detached via noteExecutionSplit) and must NOT be
+   * reported done — the new leaves now derive the project's completion.
+   */
+  private settleProjectExecute(project: Project): void {
+    let additions: TaskNode[] | undefined
+    try {
+      additions = this.service.applyTaskAdditions(project.id)
+    } catch (error) {
+      this.failProject(project, `task additions: ${error instanceof Error ? error.message : String(error)}`)
+      return
+    }
+    if (additions !== undefined) {
+      try {
+        this.service.noteExecutionSplit(project.id)
+      } catch {
+        // The project may have moved concurrently; the board is authoritative.
+      }
+      return
+    }
+    this.service.reportExecuteDone(project.id, 'system')
   }
 
   private async pollTask(task: TaskNode, sessions: readonly KanbanSessionSummary[] | undefined): Promise<void> {
@@ -298,6 +348,15 @@ export class KanbanSpawner {
         const project = this.service.getProject(task.projectId)
         if (project === undefined) return
         if (role === 'execute') {
+          // Consume any task-additions request BEFORE reporting done: the
+          // new leaves keep the project executing (checkProjectCompletion
+          // sees them unfinished), so order matters here.
+          try {
+            this.service.applyTaskAdditions(project.id)
+          } catch (error) {
+            this.failTask(task, `task additions: ${error instanceof Error ? error.message : String(error)}`)
+            return
+          }
           this.service.reportTaskExecuteDone(task.id, 'system')
           return
         }

@@ -9,14 +9,14 @@
  * broadcasts the new snapshot to /events subscribers.
  */
 import { randomUUID } from 'node:crypto'
-import { readFileSync, rmSync, statSync } from 'node:fs'
-import { isAbsolute, resolve, sep } from 'node:path'
+import { readFileSync, renameSync, rmSync, statSync } from 'node:fs'
+import { isAbsolute, join, resolve, sep } from 'node:path'
 import { DecompositionError, flattenDecomposition, loadDecomposition, type TaskLeaf } from './decomposition.ts'
 import { HOST_CAPABILITIES } from './protocol.ts'
 import type {
   Actor, HistoryEntry, KanbanEventPayload, KanbanSnapshot, Project, ProjectStatus, TaskKind, TaskNode,
 } from './protocol.ts'
-import { DECOMPOSITION_FILE, decompositionPathFor, projectDir } from './session-runner.ts'
+import { DECOMPOSITION_FILE, TASK_ADDITIONS_FILE, decompositionPathFor, projectDir, taskAdditionsPathFor } from './session-runner.ts'
 import { assertTransitionAllowed, TransitionError } from './state-machine.ts'
 import { emptyState, loadState, saveState, type PersistedState } from './storage.ts'
 
@@ -474,14 +474,18 @@ export class KanbanHostService {
 
   /**
    * Create the task leaves and fire their phase hooks. Dependency references
-   * resolve to leaf ids and the graph must be acyclic; a broken reference or
-   * a cycle fails the whole materialization loudly (nothing is half-created).
+   * resolve against `existing` (the project's current leaves) plus the new
+   * batch itself, and the merged graph must be acyclic; a duplicate title
+   * path, a broken reference, or a cycle fails the whole materialization
+   * loudly (nothing is half-created). Returns the created leaves.
    */
-  private materializeTasks(project: Project, leaves: TaskLeaf[]): void {
+  private materializeTasks(project: Project, leaves: TaskLeaf[], existing: TaskNode[] = []): TaskNode[] {
     const now = Date.now()
     const byPath = new Map<string, TaskNode>()
+    for (const task of existing) byPath.set(task.titlePath, task)
     const pending: TaskNode[] = []
     for (const leaf of leaves) {
+      if (byPath.has(leaf.titlePath)) throw new DecompositionError(`duplicate task title path: ${leaf.titlePath}`)
       const task: TaskNode = {
         id: randomUUID(),
         projectId: project.id,
@@ -496,7 +500,6 @@ export class KanbanHostService {
         lastActivityAt: now,
         history: [],
       }
-      if (byPath.has(leaf.titlePath)) throw new DecompositionError(`duplicate task title path: ${leaf.titlePath}`)
       byPath.set(leaf.titlePath, task)
       pending.push(task)
     }
@@ -510,7 +513,9 @@ export class KanbanHostService {
         return dependency.id
       })
     }
-    assertAcyclic(pending)
+    // The existing graph is acyclic by construction; new edges only ever
+    // originate from the new batch, so checking the merged graph suffices.
+    assertAcyclic([...existing, ...pending])
     for (const task of pending) {
       this.state.tasks.push(task)
       this.taskCommit(task, 'system', 'backlog', task.status, 'materialized')
@@ -518,6 +523,43 @@ export class KanbanHostService {
       if (task.kind === 'research' || task.kind === 'design') this.onEnterTaskDesigning(created)
       if (task.kind === 'execute') this.onEnterTaskExecuting(created)
     }
+    return pending
+  }
+
+  /**
+   * Consume an execution agent's task-additions request: materialize the
+   * requested leaves (dependency references may point at ANY existing leaf
+   * of the project, done or in-flight), then rename the request file to
+   * `tasks-additions.<epochMillis>.consumed.json` so it is never consumed
+   * twice (the rename also keeps an audit trail). Returns the new leaves, or
+   * undefined when no request file exists. A malformed request throws
+   * DecompositionError — the caller fails the settling project/leaf loudly.
+   */
+  applyTaskAdditions(projectId: string): TaskNode[] | undefined {
+    const project = this.requireProject(projectId)
+    const file = taskAdditionsPathFor(project)
+    const decomposition = loadDecomposition(file)
+    if (decomposition === undefined) return undefined
+    const leaves = flattenDecomposition(decomposition)
+    const created = this.materializeTasks(project, leaves, this.projectTasks(projectId))
+    const stem = TASK_ADDITIONS_FILE.replace(/\.json$/, '')
+    renameSync(file, join(projectDir(project), `${stem}.${Date.now()}.consumed.json`))
+    return created
+  }
+
+  /**
+   * A project-level execution split into new task leaves: detach the settled
+   * session (metadata commit; the project stays executing). Without this the
+   * next poll tick would settle the old session again and reportExecuteDone
+   * would mark the project done while the new leaves are still running.
+   */
+  noteExecutionSplit(projectId: string, actor: Actor = 'system'): Project {
+    const project = this.requireProject(projectId)
+    if (project.sessionId === undefined && project.sessionRole === undefined) return project
+    project.sessionId = undefined
+    project.sessionRole = undefined
+    this.commit(project, actor, project.status, project.status, 'execution split into new task leaves')
+    return this.requireProject(projectId)
   }
 
   /** A decomposed project completes when every leaf is done (system derivation). */

@@ -83,6 +83,13 @@ export const PLAN_FILE = 'plan.md'
 export const DECOMPOSITION_FILE = 'tasks.json'
 
 /**
+ * The execution agent's task-additions request file name (inside the
+ * per-project artifact dir). Same schema as tasks.json; consumed (renamed
+ * to *.consumed.json) by the host when an execute turn settles.
+ */
+export const TASK_ADDITIONS_FILE = 'tasks-additions.json'
+
+/**
  * The per-project artifact directory: every artifact a project produces
  * lives under <workspaceDir>/.kanban/projects/<projectId>/, so projects
  * sharing one workspaceDir never overwrite or delete each other's files.
@@ -100,6 +107,11 @@ export function planPathFor(project: Project): string {
 /** The decomposition file the design agent writes for this project. */
 export function decompositionPathFor(project: Project): string {
   return join(projectDir(project), DECOMPOSITION_FILE)
+}
+
+/** The task-additions request file an execution agent may write mid-run. */
+export function taskAdditionsPathFor(project: Project): string {
+  return join(projectDir(project), TASK_ADDITIONS_FILE)
 }
 
 /** The directory holding this project's task-leaf artifacts. */
@@ -160,6 +172,24 @@ function parentContextLine(parent: ParentProjectContext | undefined): string[] {
   return parent === undefined ? [] : [`本项目隶属于长期项目：${parent.title} — ${parent.goal}`]
 }
 
+/**
+ * The mid-execution split instructions appended to execute prompts (both
+ * project-level and leaf-level): the agent may request new task leaves by
+ * writing the task-additions file; the host materializes and schedules
+ * them after the turn ends.
+ */
+function taskAdditionsLines(project: Project): string[] {
+  return [
+    '',
+    '如果在执行过程中发现方案未覆盖、且必须新增的独立工作项：',
+    `1. 把它们写入 ${taskAdditionsPathFor(project)}，格式与 tasks.json 完全相同`,
+    '   （decomposed/tasks/title/kind/dependsOn），dependsOn 可引用本项目任何已有子任务的标题路径；',
+    '2. 只拆分超出当前任务范围的新工作，不要重复拆分你正在执行的任务本身；',
+    '3. 写完后继续完成你职责范围内的剩余工作，然后结束回合；',
+    '   宿主会在回合结束后把新增任务物化到看板并按依赖自动调度。',
+  ]
+}
+
 /** The execution agent's task prompt: read the confirmed plan and execute it. */
 export function executePrompt(project: Project, parent?: ParentProjectContext): string {
   return [
@@ -171,6 +201,7 @@ export function executePrompt(project: Project, parent?: ParentProjectContext): 
     ...parentContextLine(parent),
     '',
     '要求：按照方案逐步执行，全部完成后结束你的回合。',
+    ...taskAdditionsLines(project),
   ].join('\n')
 }
 
@@ -249,7 +280,7 @@ export function executeTaskPrompt(
     lines.push('', '已确认的目标澄清记录：')
     for (const item of clarifications) lines.push(`- 问：${item.question}；答：${item.answer}`)
   }
-  lines.push('', '要求：按方案执行该子任务，全部完成后结束你的回合。')
+  lines.push('', '要求：按方案执行该子任务，全部完成后结束你的回合。', ...taskAdditionsLines(project))
   return lines.join('\n')
 }
 
