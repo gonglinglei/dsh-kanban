@@ -16,7 +16,7 @@
 import { existsSync } from 'node:fs'
 import type { KanbanHostService } from './host-service.ts'
 import type { Project, TaskNode } from './protocol.ts'
-import { KanbanSessionRunner, taskArtifactPath, type KanbanApi, type KanbanSessionSummary } from './session-runner.ts'
+import { KanbanSessionRunner, planPathFor, taskArtifactPath, type KanbanApi, type KanbanSessionSummary } from './session-runner.ts'
 
 const SESSION_POLL_MS = 5_000
 
@@ -83,6 +83,10 @@ export class KanbanSpawner {
       if (project.sessionId !== undefined && project.sessionRole === 'design') {
         return { kind: 'resumed', sessionId: await this.runner.resumeDesign(project) }
       }
+      // Fresh start (never resumed): a persisted legacy planPath (root-level
+      // plan.md) would misdirect planExists/design prompts, so drop it and
+      // migrate the project to its per-project artifact directory.
+      this.service.resetPlanPath(project.id)
       return { kind: 'launched', sessionId: await this.runner.launchDesign(project) }
     })
     if (result.kind === 'failed') {
@@ -251,11 +255,14 @@ export class KanbanSpawner {
       }
       try {
         if (role === 'design') {
+          // planExists checks planPath first (legacy compat); report the
+          // same path so a resumed legacy project keeps its recorded plan.
+          const planPath = project.planPath ?? planPathFor(project)
           if (!this.runner.planExists(project)) {
-            this.failProject(project, `design ended but ${project.workspaceDir}/plan.md is missing`)
+            this.failProject(project, `design ended but ${planPath} is missing`)
             return
           }
-          this.service.reportDesignDone(project.id, `${project.workspaceDir}/plan.md`, 'system')
+          this.service.reportDesignDone(project.id, planPath, 'system')
         } else {
           this.service.reportExecuteDone(project.id, 'system')
         }
@@ -283,7 +290,7 @@ export class KanbanSpawner {
           this.service.reportTaskExecuteDone(task.id, 'system')
           return
         }
-        const artifactPath = taskArtifactPath(project.workspaceDir, task.id)
+        const artifactPath = taskArtifactPath(project, task.id)
         if (!existsSync(artifactPath)) {
           this.failTask(task, `${role} ended but ${artifactPath} is missing`)
           return

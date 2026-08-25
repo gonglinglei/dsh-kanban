@@ -1,10 +1,10 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { KanbanHostService } from '../src/host-service.ts'
 import { KanbanSpawner } from '../src/spawner.ts'
-import type { KanbanHistoryEvent, KanbanSessionSummary } from '../src/session-runner.ts'
+import { planPathFor, type KanbanHistoryEvent, type KanbanSessionSummary } from '../src/session-runner.ts'
 import { FakeApi } from './fake-api.ts'
 
 let dir: string
@@ -59,12 +59,12 @@ describe('KanbanSpawner', () => {
     await flush(1)
 
     // Design turn finishes with the plan artifact on disk.
-    writeFileSync(join(dir, 'plan.md'), '# 方案', 'utf8')
+    writeFileSync(planPathFor(project), '# 方案', 'utf8')
     api.sessions.summaries.set('sess-1', { sessionId: 'sess-1', running: false })
     api.sessions.histories.set('sess-1', [turnEnd(Date.now() + 1)])
     await flush()
     expect(service.getProject(project.id)?.status).toBe('awaiting-review')
-    expect(service.getProject(project.id)?.planPath).toBe(join(dir, 'plan.md'))
+    expect(service.getProject(project.id)?.planPath).toBe(planPathFor(project))
 
     // Human confirms → execution session spawns.
     service.confirmPlan(project.id)
@@ -113,7 +113,7 @@ describe('KanbanSpawner', () => {
     spawner.start()
     const project = service.createProject({ title: 't', workspaceDir: dir, goal: 'g' })
     await flush(1)
-    writeFileSync(join(dir, 'plan.md'), '# 方案', 'utf8')
+    writeFileSync(planPathFor(project), '# 方案', 'utf8')
     api.sessions.summaries.set('sess-1', { sessionId: 'sess-1', running: false })
     api.sessions.histories.set('sess-1', [turnEnd(Date.now() + 1)])
     await flush()
@@ -195,5 +195,94 @@ describe('KanbanSpawner', () => {
     api.sessions.summaries.set('sess-exec', { sessionId: 'sess-exec', running: false })
     await flush()
     expect(service.getProject(project.id)?.status).toBe('done')
+  })
+
+  it('a fresh design round drops a persisted legacy planPath and migrates to the per-project dir', async () => {
+    const service = makeService()
+    // Legacy project (pre-spawner): design done with a ROOT-LEVEL plan path
+    // persisted, and a stale root plan.md still on disk.
+    const project = service.createProject({ title: 't', workspaceDir: dir, goal: 'g' })
+    const legacyPath = join(dir, 'plan.md')
+    service.reportDesignDone(project.id, legacyPath)
+    writeFileSync(legacyPath, '# 别的项目的旧方案', 'utf8')
+
+    const api = new FakeApi()
+    const spawner = new KanbanSpawner(service, api)
+    spawner.start()
+    // Human sends the project into a FRESH design round (no session attached,
+    // so the spawner takes the fresh-launch branch).
+    service.transition(project.id, 'designing', '重新设计')
+    await flush(1)
+
+    // The legacy planPath is gone; the new design prompt points at the
+    // per-project artifact path, not the workspace root.
+    expect(service.getProject(project.id)?.planPath).toBeUndefined()
+    expect(api.sessions.created).toHaveLength(1)
+    expect(api.sessions.prompted.at(-1)?.text).toContain(planPathFor(project))
+    expect(api.sessions.prompted.at(-1)?.text).not.toContain(`写入 ${legacyPath}`)
+
+    // The design turn ends WITHOUT writing the new plan: the stale root
+    // plan.md must NOT be mistaken for this round's plan.
+    api.sessions.summaries.set('sess-1', { sessionId: 'sess-1', running: false })
+    api.sessions.histories.set('sess-1', [turnEnd(Date.now() + 1)])
+    await flush()
+    expect(service.getProject(project.id)?.status).toBe('blocked')
+    expect(service.getProject(project.id)?.history.at(-1)?.note).toContain('is missing')
+  })
+
+  it('a rejection resume keeps the persisted legacy planPath (fresh-round reset does not fire)', async () => {
+    const service = makeService()
+    // Legacy project with an attached design session and a persisted root plan.
+    const project = service.createProject({ title: 't', workspaceDir: dir, goal: 'g' })
+    service.attachSession(project.id, 'sess-1', 'design')
+    const legacyPath = join(dir, 'plan.md')
+    service.reportDesignDone(project.id, legacyPath)
+
+    const api = new FakeApi()
+    const spawner = new KanbanSpawner(service, api)
+    spawner.start()
+    service.rejectPlan(project.id, '需要预算章节')
+    await flush(1)
+
+    // Resume branch: same session re-prompted, planPath untouched, and the
+    // resume prompt still targets the recorded plan file.
+    expect(api.sessions.created).toHaveLength(0)
+    expect(api.sessions.prompted.at(-1)?.sessionId).toBe('sess-1')
+    expect(api.sessions.prompted.at(-1)?.text).toContain(legacyPath)
+    expect(service.getProject(project.id)?.planPath).toBe(legacyPath)
+  })
+
+  it('parallel projects sharing one workspaceDir never clobber each other\'s artifacts', async () => {
+    const service = makeService()
+    const api = new FakeApi()
+    const spawner = new KanbanSpawner(service, api)
+    spawner.start()
+
+    // Project B settles its design first and keeps its artifacts on disk.
+    const projectB = service.createProject({ title: 'B', workspaceDir: dir, goal: 'gb' })
+    await flush(1)
+    writeFileSync(planPathFor(projectB), '# B 的方案', 'utf8')
+    api.sessions.summaries.set('sess-1', { sessionId: 'sess-1', running: false })
+    api.sessions.histories.set('sess-1', [turnEnd(Date.now() + 1)])
+    await flush()
+    expect(service.getProject(projectB.id)?.status).toBe('awaiting-review')
+    expect(service.getProject(projectB.id)?.planPath).toBe(planPathFor(projectB))
+
+    // Project A starts a fresh design round in the SAME workspaceDir: its
+    // stale-artifact cleanup must not touch B's plan.
+    const projectA = service.createProject({ title: 'A', workspaceDir: dir, goal: 'ga' })
+    await flush(1)
+    expect(readFileSync(planPathFor(projectB), 'utf8')).toBe('# B 的方案')
+    expect(service.getProject(projectB.id)?.status).toBe('awaiting-review')
+
+    // A's design ends with its own plan; the two plans are distinct files.
+    writeFileSync(planPathFor(projectA), '# A 的方案', 'utf8')
+    api.sessions.summaries.set('sess-2', { sessionId: 'sess-2', running: false })
+    api.sessions.histories.set('sess-2', [turnEnd(Date.now() + 1)])
+    await flush()
+    expect(service.getProject(projectA.id)?.status).toBe('awaiting-review')
+    expect(service.getProject(projectA.id)?.planPath).toBe(planPathFor(projectA))
+    expect(service.getProject(projectA.id)?.planPath).not.toBe(service.getProject(projectB.id)?.planPath)
+    expect(readFileSync(planPathFor(projectB), 'utf8')).toBe('# B 的方案')
   })
 })

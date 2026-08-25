@@ -1,12 +1,15 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { Project } from '../src/protocol.ts'
 import {
+  decompositionPathFor,
   designPrompt,
   executePrompt,
   KanbanSessionRunner,
+  planPathFor,
+  projectDir,
   resumePrompt,
   SessionLaunchError,
   type KanbanApi,
@@ -62,23 +65,39 @@ describe('KanbanSessionRunner', () => {
     expect(api.sessions.renamed).toEqual([{ sessionId, title: 'demo·设计' }])
     expect(api.sessions.prompted[0]?.sessionId).toBe(sessionId)
     expect(api.sessions.prompted[0]?.text).toContain('build a thing')
-    expect(api.sessions.prompted[0]?.text).toContain(join(dir, 'plan.md'))
+    expect(api.sessions.prompted[0]?.text).toContain(planPathFor(project))
+    expect(api.sessions.prompted[0]?.text).toContain(decompositionPathFor(project))
+    // The launch pre-creates the per-project artifact directory.
+    expect(existsSync(projectDir(project))).toBe(true)
   })
 
-  it('launchDesign clears stale artifacts so an old plan/tasks.json cannot leak into the new phase', async () => {
+  it('launchDesign clears only this project\'s stale artifacts, never a parallel project\'s', async () => {
     const api = new FakeApi()
     const runner = new KanbanSessionRunner(api)
-    const project = sampleProject()
-    // Stale artifacts from a previous design round.
-    writeFileSync(join(dir, 'plan.md'), '旧方案', 'utf8')
-    writeFileSync(join(dir, 'tasks.json'), '{"tasks":[]}', 'utf8')
-    mkdirSync(join(dir, '.kanban', 'artifacts'), { recursive: true })
-    writeFileSync(join(dir, '.kanban', 'artifacts', 'old.md'), 'x', 'utf8')
+    const projectA = sampleProject({ id: 'pa' })
+    const projectB = sampleProject({ id: 'pb', title: 'other' })
+    // Stale artifacts from project A's previous design round.
+    mkdirSync(join(projectDir(projectA), 'artifacts'), { recursive: true })
+    writeFileSync(planPathFor(projectA), '旧方案', 'utf8')
+    writeFileSync(decompositionPathFor(projectA), '{"tasks":[]}', 'utf8')
+    writeFileSync(join(projectDir(projectA), 'artifacts', 'old.md'), 'x', 'utf8')
+    // Project B shares the same workspaceDir and is mid-flight: its plan,
+    // decomposition and task artifacts must survive A's fresh design round.
+    mkdirSync(join(projectDir(projectB), 'artifacts'), { recursive: true })
+    writeFileSync(planPathFor(projectB), 'B 的方案', 'utf8')
+    writeFileSync(decompositionPathFor(projectB), '{"decomposed":true,"tasks":[]}', 'utf8')
+    writeFileSync(join(projectDir(projectB), 'artifacts', 'b.md'), 'B 的产物', 'utf8')
+    // Legacy root-level files are left alone too.
+    writeFileSync(join(dir, 'plan.md'), '根目录方案', 'utf8')
 
-    await runner.launchDesign(project)
-    expect(existsSync(join(dir, 'plan.md'))).toBe(false)
-    expect(existsSync(join(dir, 'tasks.json'))).toBe(false)
-    expect(existsSync(join(dir, '.kanban'))).toBe(false)
+    await runner.launchDesign(projectA)
+    expect(existsSync(projectDir(projectA))).toBe(true) // re-created by launch
+    expect(existsSync(planPathFor(projectA))).toBe(false)
+    expect(existsSync(join(projectDir(projectA), 'artifacts', 'old.md'))).toBe(false)
+    expect(readFileSync(planPathFor(projectB), 'utf8')).toBe('B 的方案')
+    expect(readFileSync(decompositionPathFor(projectB), 'utf8')).toBe('{"decomposed":true,"tasks":[]}')
+    expect(readFileSync(join(projectDir(projectB), 'artifacts', 'b.md'), 'utf8')).toBe('B 的产物')
+    expect(readFileSync(join(dir, 'plan.md'), 'utf8')).toBe('根目录方案')
   })
 
   it('launches an execution session with the confirmed plan path', async () => {
@@ -139,15 +158,26 @@ describe('KanbanSessionRunner', () => {
 
   it('planExists reflects the on-disk artifact', () => {
     const runner = new KanbanSessionRunner(new FakeApi())
-    expect(runner.planExists(sampleProject())).toBe(false)
-    writeFileSync(join(dir, 'plan.md'), '# 方案', 'utf8')
-    expect(runner.planExists(sampleProject())).toBe(true)
+    const project = sampleProject()
+    expect(runner.planExists(project)).toBe(false)
+    mkdirSync(projectDir(project), { recursive: true })
+    writeFileSync(planPathFor(project), '# 方案', 'utf8')
+    expect(runner.planExists(project)).toBe(true)
+  })
+
+  it('planExists prefers a persisted planPath (legacy root-level plan, resume compat)', () => {
+    const runner = new KanbanSessionRunner(new FakeApi())
+    const project = sampleProject({ planPath: join(dir, 'plan.md') })
+    expect(runner.planExists(project)).toBe(false)
+    writeFileSync(join(dir, 'plan.md'), '# 旧方案', 'utf8')
+    expect(runner.planExists(project)).toBe(true)
   })
 
   it('builds prompts with the project facts', () => {
     const project = sampleProject({ feedback: '改一下' })
     expect(designPrompt(project)).toContain('build a thing')
-    expect(executePrompt(project)).toContain(join(dir, 'plan.md'))
+    expect(executePrompt(project)).toContain(planPathFor(project))
     expect(resumePrompt(project)).toContain('改一下')
+    expect(resumePrompt(project)).toContain(planPathFor(project))
   })
 })

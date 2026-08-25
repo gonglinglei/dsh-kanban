@@ -243,6 +243,77 @@ describe('Board rendering', () => {
     expect(document.documentElement.hasAttribute('data-dsh-kanban-active')).toBe(false)
   })
 
+  it('a task-card session open calls through and closes the board, same as the project card', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = {
+      revision: 1,
+      // The project carries no session of its own, so the only 打开会话
+      // button in the column is the task card's.
+      projects: [project({ id: 'p1', status: 'executing', sessionId: undefined })],
+      tasks: [task({ id: 't1', titlePath: '后端 > API 实现', kind: 'execute', status: 'executing', sessionId: 'session-task' })],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    const openSession = vi.fn()
+    await renderBoard(store, openSession)
+    await act(async () => { toggleBoard() })
+    expect(isBoardOpen()).toBe(true)
+
+    const openButton = [...container.querySelectorAll('button')].find(button => button.textContent === '打开会话')
+    expect(openButton).toBeDefined()
+    await act(async () => { openButton!.click() })
+    expect(openSession).toHaveBeenCalledWith('session-task')
+    // The regression: the task card used to leave the board covering the
+    // freshly opened session, reading as a dead click.
+    expect(isBoardOpen()).toBe(false)
+    expect(document.documentElement.hasAttribute('data-dsh-kanban-active')).toBe(false)
+  })
+
+  it('a failing task-card session open shows the error and keeps the board open', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = {
+      revision: 1,
+      projects: [project({ id: 'p1', status: 'executing', sessionId: undefined })],
+      tasks: [task({ id: 't1', titlePath: '后端 > API 实现', kind: 'execute', status: 'executing', sessionId: 'session-task' })],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    const openSession = vi.fn(() => { throw new Error('sessions.select: unknown session session-task') })
+    await renderBoard(store, openSession)
+    await act(async () => { toggleBoard() })
+    expect(isBoardOpen()).toBe(true)
+
+    const openButton = [...container.querySelectorAll('button')].find(button => button.textContent === '打开会话')
+    await act(async () => { openButton!.click() })
+
+    expect(container.textContent).toContain('无法打开会话')
+    expect(container.textContent).toContain('unknown session')
+    // The error must stay visible on the board, so the board must stay open.
+    expect(isBoardOpen()).toBe(true)
+    expect(document.documentElement.hasAttribute('data-dsh-kanban-active')).toBe(true)
+  })
+
+  it('a project-detail session open calls through and closes the board, same as the cards', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = { revision: 1, projects: [project({ id: 'a', status: 'executing' })], tasks: [] }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    const openSession = vi.fn()
+    await renderBoard(store, openSession)
+    await act(async () => { toggleBoard() })
+    expect(isBoardOpen()).toBe(true)
+
+    const detailButton = [...container.querySelectorAll('button')].find(button => button.textContent === '详情')
+    await act(async () => { detailButton!.click() })
+    const openButton = [...container.querySelectorAll('button')].find(button => button.textContent === '打开会话')
+    expect(openButton).toBeDefined()
+    await act(async () => { openButton!.click() })
+
+    expect(openSession).toHaveBeenCalledWith('session-abc')
+    expect(isBoardOpen()).toBe(false)
+    expect(document.documentElement.hasAttribute('data-dsh-kanban-active')).toBe(false)
+  })
+
   it('renders task leaves in their columns with kind badges and paths', async () => {
     const transport = new FakeTransport()
     transport.stateValue = {

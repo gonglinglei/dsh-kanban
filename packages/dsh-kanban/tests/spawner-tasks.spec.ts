@@ -4,7 +4,13 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { KanbanHostService } from '../src/host-service.ts'
 import { KanbanSpawner } from '../src/spawner.ts'
-import type { KanbanHistoryEvent } from '../src/session-runner.ts'
+import {
+  decompositionPathFor,
+  projectArtifactsDir,
+  projectDir,
+  taskArtifactPath,
+  type KanbanHistoryEvent,
+} from '../src/session-runner.ts'
 import { FakeApi } from './fake-api.ts'
 
 let dir: string
@@ -46,7 +52,8 @@ const DECOMPOSITION = {
 
 function decomposeProject(service: KanbanHostService): string {
   const project = service.createProject({ title: 't', workspaceDir: dir, goal: 'g' })
-  writeFileSync(join(dir, 'tasks.json'), JSON.stringify(DECOMPOSITION), 'utf8')
+  mkdirSync(projectDir(project), { recursive: true })
+  writeFileSync(decompositionPathFor(project), JSON.stringify(DECOMPOSITION), 'utf8')
   service.confirmPlan(project.id)
   return project.id
 }
@@ -92,8 +99,9 @@ describe('KanbanSpawner task leaves', () => {
     const research = service.projectTasks(projectId).find(task => task.kind === 'research')!
     const sessionId = research.sessionId!
 
-    const artifactPath = join(dir, '.kanban', 'artifacts', `${research.id}.md`)
-    mkdirSync(join(dir, '.kanban', 'artifacts'), { recursive: true })
+    const project = service.getProject(projectId)!
+    const artifactPath = taskArtifactPath(project, research.id)
+    mkdirSync(projectArtifactsDir(project), { recursive: true })
     writeFileSync(artifactPath, '# 调研结论', 'utf8')
     api.sessions.summaries.set(sessionId, { sessionId, running: false })
     api.sessions.histories.set(sessionId, [turnEnd(Date.now() + 1)])
@@ -129,8 +137,9 @@ describe('KanbanSpawner task leaves', () => {
     const design = service.projectTasks(projectId).find(task => task.kind === 'design')!
     const sessionId = design.sessionId!
 
-    mkdirSync(join(dir, '.kanban', 'artifacts'), { recursive: true })
-    writeFileSync(join(dir, '.kanban', 'artifacts', `${design.id}.md`), '# 设计', 'utf8')
+    const project = service.getProject(projectId)!
+    mkdirSync(projectArtifactsDir(project), { recursive: true })
+    writeFileSync(taskArtifactPath(project, design.id), '# 设计', 'utf8')
     api.sessions.summaries.set(sessionId, { sessionId, running: false })
     api.sessions.histories.set(sessionId, [turnEnd(Date.now() + 1)])
     await flush()
@@ -167,7 +176,8 @@ describe('KanbanSpawner task leaves', () => {
     const spawner = new KanbanSpawner(service, api)
     spawner.start()
     const project = service.createProject({ title: 't', workspaceDir: dir, goal: 'g' })
-    writeFileSync(join(dir, 'tasks.json'), JSON.stringify({
+    mkdirSync(projectDir(project), { recursive: true })
+    writeFileSync(decompositionPathFor(project), JSON.stringify({
       decomposed: true,
       tasks: [
         { title: '架构设计', kind: 'design' },
@@ -187,8 +197,8 @@ describe('KanbanSpawner task leaves', () => {
     expect(test.sessionId).toBeUndefined()
 
     // Design completes -> code spawns; test still waits.
-    mkdirSync(join(dir, '.kanban', 'artifacts'), { recursive: true })
-    writeFileSync(join(dir, '.kanban', 'artifacts', `${design.id}.md`), '# 设计', 'utf8')
+    mkdirSync(projectArtifactsDir(project), { recursive: true })
+    writeFileSync(taskArtifactPath(project, design.id), '# 设计', 'utf8')
     api.sessions.summaries.set(design.sessionId!, { sessionId: design.sessionId!, running: false })
     api.sessions.histories.set(design.sessionId!, [turnEnd(Date.now() + 1)])
     await flush()
@@ -219,10 +229,11 @@ describe('KanbanSpawner task leaves', () => {
     await flush()
 
     // Research/design/execute: finish their sessions with artifacts.
-    mkdirSync(join(dir, '.kanban', 'artifacts'), { recursive: true })
+    const project = service.getProject(projectId)!
+    mkdirSync(projectArtifactsDir(project), { recursive: true })
     for (const kind of ['research', 'design', 'execute'] as const) {
       const task = service.projectTasks(projectId).find(task => task.kind === kind)!
-      writeFileSync(join(dir, '.kanban', 'artifacts', `${task.id}.md`), '# 产出', 'utf8')
+      writeFileSync(taskArtifactPath(project, task.id), '# 产出', 'utf8')
       api.sessions.summaries.set(task.sessionId!, { sessionId: task.sessionId!, running: false })
       api.sessions.histories.set(task.sessionId!, [turnEnd(Date.now() + 1)])
     }

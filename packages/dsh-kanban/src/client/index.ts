@@ -47,9 +47,11 @@ export function apply(ctx: ClientContext): void {
   const openSession = (sessionId: string): void => {
     // sessions.open only accepts sessions of the current workspace list; a
     // project whose directory is another workspace gets its sessions there,
-    // so preflight for an actionable message instead of a silent throw.
-    const known = sessions.list.getSnapshot().byId[sessionId as SessionId] !== undefined
-    if (!known) {
+    // so preflight for an actionable message instead of a silent throw. Only
+    // preflight against a ready list: a pending list misses every session
+    // and would false-positive, so defer to sessions.select's own check.
+    const snapshot = sessions.list.getSnapshot()
+    if (snapshot.phase === 'ready' && snapshot.byId[sessionId as SessionId] === undefined) {
       throw new Error('会话不在当前工作区列表中，请在侧边栏切换到对应工作区后重试')
     }
     sessions.open(sessionId as SessionId)

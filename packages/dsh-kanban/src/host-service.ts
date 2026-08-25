@@ -9,20 +9,21 @@
  * broadcasts the new snapshot to /events subscribers.
  */
 import { randomUUID } from 'node:crypto'
-import { readFileSync, statSync } from 'node:fs'
-import { isAbsolute, join, resolve, sep } from 'node:path'
+import { readFileSync, rmSync, statSync } from 'node:fs'
+import { isAbsolute, resolve, sep } from 'node:path'
 import { DecompositionError, flattenDecomposition, loadDecomposition, type TaskLeaf } from './decomposition.ts'
 import type {
   Actor, HistoryEntry, KanbanEventPayload, KanbanSnapshot, Project, ProjectStatus, TaskKind, TaskNode,
 } from './protocol.ts'
+import { DECOMPOSITION_FILE, decompositionPathFor, projectDir } from './session-runner.ts'
 import { assertTransitionAllowed, TransitionError } from './state-machine.ts'
 import { emptyState, loadState, saveState, type PersistedState } from './storage.ts'
 
 /** Stale-timer tick cadence (seconds); the check is a no-op when maxStaleMinutes is 0. */
 const STALE_TICK_SECONDS = 30
 
-/** The design agent's decomposition file, next to plan.md. */
-export const DECOMPOSITION_FILE = 'tasks.json'
+/** The design agent's decomposition file name (inside the per-project artifact dir). */
+export { DECOMPOSITION_FILE }
 
 /** Per-file size ceiling for readProjectFile (the detail view's plan preview). */
 export const PROJECT_FILE_LIMIT = 512 * 1024
@@ -242,6 +243,20 @@ export class KanbanHostService {
     return this.requireProject(projectId)
   }
 
+  /**
+   * Fresh design round: drop a persisted (legacy root-level) plan path so the
+   * project migrates to its per-project artifact directory. No-op when no
+   * plan path is persisted (the common case for fresh projects).
+   */
+  resetPlanPath(projectId: string, actor: Actor = 'system'): Project {
+    const project = this.requireProject(projectId)
+    if (project.planPath !== undefined) {
+      project.planPath = undefined
+      this.commit(project, actor, project.status, project.status, 'plan path reset (fresh design)')
+    }
+    return this.requireProject(projectId)
+  }
+
   /** The execution agent's turn ended. */
   reportExecuteDone(projectId: string, actor: Actor = 'system'): Project {
     this.applyTransition(projectId, 'done', actor, 'execution done', { fireHooks: false })
@@ -264,8 +279,11 @@ export class KanbanHostService {
   deleteProject(projectId: string): void {
     const index = this.state.projects.findIndex(project => project.id === projectId)
     if (index < 0) throw new TransitionError(`unknown project ${projectId}`)
+    const project = this.state.projects[index]!
     this.state.projects.splice(index, 1)
     this.state.tasks = this.state.tasks.filter(task => task.projectId !== projectId)
+    // Hygiene: the project's on-disk artifacts go with it.
+    rmSync(projectDir(project), { recursive: true, force: true })
     this.mutate()
   }
 
@@ -404,7 +422,7 @@ export class KanbanHostService {
 
   /** Read the decomposition file the design agent wrote; undefined when not decomposed. */
   private loadDecompositionLeaves(project: Project): TaskLeaf[] {
-    const decomposition = loadDecomposition(join(project.workspaceDir, DECOMPOSITION_FILE))
+    const decomposition = loadDecomposition(decompositionPathFor(project))
     if (decomposition === undefined) return []
     return flattenDecomposition(decomposition)
   }

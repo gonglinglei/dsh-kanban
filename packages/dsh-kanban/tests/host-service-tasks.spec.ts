@@ -1,8 +1,9 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { KanbanHostService } from '../src/host-service.ts'
+import { decompositionPathFor, projectDir, taskArtifactPath } from '../src/session-runner.ts'
 import { TransitionError } from '../src/state-machine.ts'
 
 let dir: string
@@ -33,7 +34,8 @@ const DECOMPOSITION = {
 
 function decomposeProject(service: KanbanHostService): string {
   const project = service.createProject({ title: 't', workspaceDir: dir, goal: 'g' })
-  writeFileSync(join(dir, 'tasks.json'), JSON.stringify(DECOMPOSITION), 'utf8')
+  mkdirSync(projectDir(project), { recursive: true })
+  writeFileSync(decompositionPathFor(project), JSON.stringify(DECOMPOSITION), 'utf8')
   service.confirmPlan(project.id)
   return project.id
 }
@@ -114,9 +116,10 @@ describe('KanbanHostService task decomposition', () => {
     service.confirmTask(projectId, clarify.id)
     expect(service.getProject(projectId)?.status).toBe('executing')
 
-    service.reportTaskArtifactDone(research.id, join(dir, '.kanban', 'artifacts', `${research.id}.md`), 'system')
+    const project = service.getProject(projectId)!
+    service.reportTaskArtifactDone(research.id, taskArtifactPath(project, research.id), 'system')
     service.verifyTaskDone(research.id, 'verified')
-    service.reportTaskArtifactDone(design.id, join(dir, '.kanban', 'artifacts', `${design.id}.md`), 'system')
+    service.reportTaskArtifactDone(design.id, taskArtifactPath(project, design.id), 'system')
     service.confirmTask(projectId, design.id)
     service.reportTaskExecuteDone(execute.id, 'system')
     // The last leaf completing derives the project completion.
@@ -150,13 +153,36 @@ describe('KanbanHostService task decomposition', () => {
     second.start()
     expect(second.projectTasks(projectId)).toHaveLength(4)
   })
+
+  it('parallel projects sharing one workspaceDir confirm their own decomposition', () => {
+    const service = makeService()
+    const a = service.createProject({ title: 'A', workspaceDir: dir, goal: 'ga' })
+    const b = service.createProject({ title: 'B', workspaceDir: dir, goal: 'gb' })
+    mkdirSync(projectDir(a), { recursive: true })
+    mkdirSync(projectDir(b), { recursive: true })
+    writeFileSync(decompositionPathFor(a), JSON.stringify({
+      decomposed: true,
+      tasks: [{ title: 'A 的任务', kind: 'execute' }],
+    }), 'utf8')
+    writeFileSync(decompositionPathFor(b), JSON.stringify({
+      decomposed: true,
+      tasks: [{ title: 'B 的任务', kind: 'execute' }],
+    }), 'utf8')
+
+    service.confirmPlan(a.id)
+    expect(service.projectTasks(a.id).map(task => task.titlePath)).toEqual(['A 的任务'])
+    // B's decomposition is untouched by A's confirmation.
+    service.confirmPlan(b.id)
+    expect(service.projectTasks(b.id).map(task => task.titlePath)).toEqual(['B 的任务'])
+  })
 })
 
 describe('KanbanHostService dependency graph', () => {
   it('resolves dependsOn titles to leaf ids', () => {
     const service = makeService()
     const project = service.createProject({ title: 't', workspaceDir: dir, goal: 'g' })
-    writeFileSync(join(dir, 'tasks.json'), JSON.stringify({
+    mkdirSync(projectDir(project), { recursive: true })
+    writeFileSync(decompositionPathFor(project), JSON.stringify({
       decomposed: true,
       tasks: [
         { title: '架构设计', kind: 'design' },
@@ -172,7 +198,8 @@ describe('KanbanHostService dependency graph', () => {
   it('fails loudly on an unknown dependency reference', () => {
     const service = makeService()
     const project = service.createProject({ title: 't', workspaceDir: dir, goal: 'g' })
-    writeFileSync(join(dir, 'tasks.json'), JSON.stringify({
+    mkdirSync(projectDir(project), { recursive: true })
+    writeFileSync(decompositionPathFor(project), JSON.stringify({
       decomposed: true,
       tasks: [
         { title: '编码实现', kind: 'execute', dependsOn: ['不存在的任务'] },
@@ -186,7 +213,8 @@ describe('KanbanHostService dependency graph', () => {
   it('fails loudly on a dependency cycle', () => {
     const service = makeService()
     const project = service.createProject({ title: 't', workspaceDir: dir, goal: 'g' })
-    writeFileSync(join(dir, 'tasks.json'), JSON.stringify({
+    mkdirSync(projectDir(project), { recursive: true })
+    writeFileSync(decompositionPathFor(project), JSON.stringify({
       decomposed: true,
       tasks: [
         { title: 'A', kind: 'execute', dependsOn: ['B'] },

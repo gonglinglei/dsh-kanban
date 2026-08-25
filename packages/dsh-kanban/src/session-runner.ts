@@ -76,6 +76,46 @@ function isErrorTurnEnd(data: unknown): boolean {
   return typeof reason === 'object' && reason !== null && (reason as { kind?: unknown }).kind === 'error'
 }
 
+/** The design agent's plan file name (inside the per-project artifact dir). */
+export const PLAN_FILE = 'plan.md'
+
+/** The design agent's decomposition file name (inside the per-project artifact dir). */
+export const DECOMPOSITION_FILE = 'tasks.json'
+
+/**
+ * The per-project artifact directory: every artifact a project produces
+ * lives under <workspaceDir>/.kanban/projects/<projectId>/, so projects
+ * sharing one workspaceDir never overwrite or delete each other's files.
+ * This is the single place artifact paths are derived from.
+ */
+export function projectDir(project: Project): string {
+  return join(project.workspaceDir, '.kanban', 'projects', project.id)
+}
+
+/** The plan file the design agent writes for this project. */
+export function planPathFor(project: Project): string {
+  return join(projectDir(project), PLAN_FILE)
+}
+
+/** The decomposition file the design agent writes for this project. */
+export function decompositionPathFor(project: Project): string {
+  return join(projectDir(project), DECOMPOSITION_FILE)
+}
+
+/** The directory holding this project's task-leaf artifacts. */
+export function projectArtifactsDir(project: Project): string {
+  return join(projectDir(project), 'artifacts')
+}
+
+/**
+ * The plan path a prompt should point at: a persisted planPath (e.g. a
+ * legacy project whose plan still sits at the workspace root) wins;
+ * otherwise the per-project artifact dir.
+ */
+function planPathHint(project: Project): string {
+  return project.planPath ?? planPathFor(project)
+}
+
 /** The design agent's task prompt: produce the plan (and optionally the decomposition), then stop. */
 export function designPrompt(project: Project): string {
   return [
@@ -86,10 +126,10 @@ export function designPrompt(project: Project): string {
     `目标：${project.goal}`,
     '',
     '要求：',
-    `1. 把方案写入 ${join(project.workspaceDir, 'plan.md')}（Markdown）。`,
+    `1. 把方案写入 ${planPathFor(project)}（Markdown）。`,
     '2. 方案必须包含：目标拆解、执行步骤、验收标准。',
     '3. 判断任务本身是否已经具体到可直接执行。如果不可直接执行，额外把拆解清单写入',
-    `   ${join(project.workspaceDir, 'tasks.json')}，格式如下：`,
+    `   ${decompositionPathFor(project)}，格式如下：`,
     '   { "decomposed": true, "tasks": [',
     '     { "title": "子任务标题", "kind": "clarify", "question": "需要创建人明确的问题" },',
     '     { "title": "子任务标题", "kind": "research" },',
@@ -116,7 +156,7 @@ export function executePrompt(project: Project): string {
     '',
     `项目：${project.title}`,
     `工作目录：${project.workspaceDir}`,
-    `方案文件：${project.planPath ?? join(project.workspaceDir, 'plan.md')}`,
+    `方案文件：${planPathHint(project)}`,
     '',
     '要求：按照方案逐步执行，全部完成后结束你的回合。',
   ].join('\n')
@@ -129,7 +169,7 @@ export function resumePrompt(project: Project): string {
     '',
     project.feedback ?? '（无具体反馈，请自行检查方案质量后改进）',
     '',
-    `请修改 ${join(project.workspaceDir, 'plan.md')} 后结束你的回合。`,
+    `请修改 ${planPathHint(project)} 后结束你的回合。`,
   ].join('\n')
 }
 
@@ -140,15 +180,15 @@ export function executeResumePrompt(project: Project): string {
     '',
     `项目：${project.title}`,
     `工作目录：${project.workspaceDir}`,
-    `方案文件：${project.planPath ?? join(project.workspaceDir, 'plan.md')}`,
+    `方案文件：${planPathHint(project)}`,
     '',
     '请检查当前进度，继续按方案执行，全部完成后结束你的回合。',
   ].join('\n')
 }
 
 /** The artifact file of a research/design leaf. */
-export function taskArtifactPath(workspaceDir: string, taskId: string): string {
-  return join(workspaceDir, '.kanban', 'artifacts', `${taskId}.md`)
+export function taskArtifactPath(project: Project, taskId: string): string {
+  return join(projectArtifactsDir(project), `${taskId}.md`)
 }
 
 /** The research leaf prompt: investigate the question, write the report, stop. */
@@ -158,9 +198,9 @@ export function researchTaskPrompt(task: TaskNode, project: Project): string {
     '',
     `子任务：${task.titlePath}`,
     `所属项目：${project.title}（目标：${project.goal}）`,
-    `项目方案：${project.planPath ?? join(project.workspaceDir, 'plan.md')}`,
+    `项目方案：${planPathHint(project)}`,
     '',
-    `要求：把调研结论写入 ${taskArtifactPath(project.workspaceDir, task.id)}（Markdown），写完结束你的回合。`,
+    `要求：把调研结论写入 ${taskArtifactPath(project, task.id)}（Markdown），写完结束你的回合。`,
   ].join('\n')
 }
 
@@ -171,9 +211,9 @@ export function designTaskPrompt(task: TaskNode, project: Project): string {
     '',
     `子任务：${task.titlePath}`,
     `所属项目：${project.title}（目标：${project.goal}）`,
-    `项目方案：${project.planPath ?? join(project.workspaceDir, 'plan.md')}`,
+    `项目方案：${planPathHint(project)}`,
     '',
-    `要求：把该部分设计写入 ${taskArtifactPath(project.workspaceDir, task.id)}（Markdown），写完结束你的回合。`,
+    `要求：把该部分设计写入 ${taskArtifactPath(project, task.id)}（Markdown），写完结束你的回合。`,
   ].join('\n')
 }
 
@@ -185,7 +225,7 @@ export function executeTaskPrompt(task: TaskNode, project: Project, clarificatio
     `子任务：${task.titlePath}`,
     `所属项目：${project.title}`,
     `工作目录：${project.workspaceDir}`,
-    `项目方案：${project.planPath ?? join(project.workspaceDir, 'plan.md')}`,
+    `项目方案：${planPathHint(project)}`,
   ]
   if (clarifications.length > 0) {
     lines.push('', '已确认的目标澄清记录：')
@@ -206,14 +246,14 @@ export class KanbanSessionRunner {
 
   /**
    * A fresh design round must start from a clean directory: a leftover
-   * plan.md/tasks.json from a previous project would either be reused by the
-   * agent ("the plan already exists") or materialized as a stale
-   * decomposition on confirm. Resume rounds (rejections) never clear.
+   * plan.md/tasks.json from a previous round of THIS project would either
+   * be reused by the agent ("the plan already exists") or materialized as a
+   * stale decomposition on confirm. Only this project's own artifact
+   * directory is cleared — other projects sharing the workspaceDir keep
+   * their in-flight files. Resume rounds (rejections) never clear.
    */
   private clearStaleArtifacts(project: Project): void {
-    rmSync(join(project.workspaceDir, 'plan.md'), { force: true })
-    rmSync(join(project.workspaceDir, 'tasks.json'), { force: true })
-    rmSync(join(project.workspaceDir, '.kanban'), { recursive: true, force: true })
+    rmSync(projectDir(project), { recursive: true, force: true })
   }
 
   /** Create + rename + prompt a fresh execution session; returns the session id. */
@@ -269,14 +309,18 @@ export class KanbanSessionRunner {
 
   /** Whether the plan file exists on disk (the design turn's required artifact). */
   planExists(project: Project): boolean {
-    return existsSync(join(project.workspaceDir, 'plan.md'))
+    // A persisted planPath (legacy root-level plan) wins for resume compat;
+    // fresh projects check their own per-project artifact path.
+    return existsSync(planPathHint(project))
   }
 
   /** Create + rename + prompt one fresh session; returns the session id. */
   private async launch(project: Project, promptText: string, title: string): Promise<string> {
     // The user may point a project at a directory that does not exist yet;
-    // the design agent needs it before it can write plan.md.
+    // the design agent needs both it and the per-project artifact directory
+    // before it can write plan.md.
     mkdirSync(project.workspaceDir, { recursive: true })
+    mkdirSync(projectDir(project), { recursive: true })
     const created = await this.api.sessions.create(request({ cwd: project.workspaceDir }))
     if (!created.result.ok) throw failure(created.result.error)
     const sessionId = created.result.value.sessionId

@@ -59,6 +59,30 @@ export interface BoardProps {
   getDefaultWorkspaceDir(): string
 }
 
+/**
+ * Shared open-session behavior for every entry point (project card, task
+ * card, project detail): clear the last error, open the session, then close
+ * the board — the opened session renders in the conversation pane, which the
+ * open board covers, so a success without closeBoard() reads as a dead
+ * button. A failure keeps the board open and surfaces the reason on the card.
+ */
+function useOpenSession(onOpenSession: (sessionId: string) => void): { openError: string | null; open(sessionId: string): void } {
+  const [openError, setOpenError] = useState<string | null>(null)
+  const open = (sessionId: string): void => {
+    setOpenError(null)
+    try {
+      onOpenSession(sessionId)
+      closeBoard()
+    } catch (error) {
+      // The runtime throws when the session is not in the current workspace
+      // list (e.g. the project's directory is a different workspace); a
+      // silent no-op reads as a broken button, so surface the reason.
+      setOpenError(error instanceof Error ? error.message : String(error))
+    }
+  }
+  return { openError, open }
+}
+
 /** The board view (MVP). */
 export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps): JSX.Element {
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot)
@@ -160,21 +184,8 @@ interface ProjectCardProps {
 }
 
 function ProjectCard({ project, taskCount, rejecting, onToggleReject, onAction, onOpenSession, onOpenDetail }: ProjectCardProps): JSX.Element {
-  const [openError, setOpenError] = useState<string | null>(null)
-  const handleOpenSession = (): void => {
-    setOpenError(null)
-    try {
-      onOpenSession(project.sessionId!)
-      // The opened session renders in the conversation pane, which the open
-      // board covers; close the board so the jump is actually visible.
-      closeBoard()
-    } catch (error) {
-      // The runtime throws when the session is not in the current workspace
-      // list (e.g. the project's directory is a different workspace); a
-      // silent no-op reads as a broken button, so surface the reason.
-      setOpenError(error instanceof Error ? error.message : String(error))
-    }
-  }
+  const { openError, open } = useOpenSession(onOpenSession)
+  const handleOpenSession = (): void => { open(project.sessionId!) }
   const sessionChip = project.sessionId !== undefined
     ? <button className="dk-btn dk-btn-ghost" onClick={handleOpenSession}>打开会话</button>
     : null
@@ -230,15 +241,8 @@ function TaskCard({ task, projectTitle, waitingFor, onAction, onOpenSession }: T
   const segments = task.titlePath.split(' > ')
   const level = segments.length - 1
   const [answerDraft, setAnswerDraft] = useState('')
-  const [openError, setOpenError] = useState<string | null>(null)
-  const handleOpenSession = (): void => {
-    setOpenError(null)
-    try {
-      onOpenSession(task.sessionId!)
-    } catch (error) {
-      setOpenError(error instanceof Error ? error.message : String(error))
-    }
-  }
+  const { openError, open } = useOpenSession(onOpenSession)
+  const handleOpenSession = (): void => { open(task.sessionId!) }
 
   return (
     <article className="dk-card" style={{ marginLeft: `${Math.min(level, 3) * 14}px` }}>
@@ -308,7 +312,7 @@ interface ProjectDetailProps {
  */
 function ProjectDetail({ project, tasks, store, onBack, onAction, onOpenSession }: ProjectDetailProps): JSX.Element {
   const [rejecting, setRejecting] = useState(false)
-  const [openError, setOpenError] = useState<string | null>(null)
+  const { openError, open } = useOpenSession(onOpenSession)
   const [plan, setPlan] = useState<{ state: 'loading' | 'loaded' | 'error'; text?: string; error?: string } | null>(null)
   const planPath = project.planPath
 
@@ -328,15 +332,7 @@ function ProjectDetail({ project, tasks, store, onBack, onAction, onOpenSession 
     return () => { cancelled = true }
   }, [planPath, store])
 
-  const handleOpenSession = (): void => {
-    setOpenError(null)
-    try {
-      onOpenSession(project.sessionId!)
-      closeBoard()
-    } catch (error) {
-      setOpenError(error instanceof Error ? error.message : String(error))
-    }
-  }
+  const handleOpenSession = (): void => { open(project.sessionId!) }
 
   return (
     <div className="dk-detail">
