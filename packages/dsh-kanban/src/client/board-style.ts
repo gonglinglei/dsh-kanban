@@ -140,6 +140,34 @@ html[data-dsh-kanban-active] [class*='centerCol'] > :not([data-dsh-kanban-view])
 [data-dsh-kanban-view] .dk-detail-history-actor { font-weight: 600; }
 [data-dsh-kanban-view] .dk-detail-history-note { color: var(--dsw-alias-text-secondary, #666); word-break: break-all; }
 
+/* Sub-task dependency graph (project detail「列表 / 依赖图」switch). */
+[data-dsh-kanban-view] .dk-detail-heading-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+[data-dsh-kanban-view] .dk-view-toggle { display: flex; gap: 4px; }
+[data-dsh-kanban-view] .dk-view-toggle .dk-btn { padding: 2px 8px; font-size: 11px; }
+[data-dsh-kanban-view] .dk-graph {
+  overflow: auto; max-height: 60vh; border-radius: 8px;
+  background: var(--dsw-alias-bg-subtle, #f4f5f7); border: 1px solid var(--dsw-alias-border, #e0e0e0);
+}
+[data-dsh-kanban-view] .dk-graph-canvas { position: relative; }
+[data-dsh-kanban-view] .dk-graph-edges { position: absolute; inset: 0; pointer-events: none; }
+[data-dsh-kanban-view] .dk-graph-edge { fill: none; stroke: #1a73e8; stroke-width: 1.5; }
+[data-dsh-kanban-view] .dk-graph-edge-done { stroke: var(--dsw-alias-border-strong, #b0b0b0); }
+[data-dsh-kanban-view] .dk-graph-arrow-head { fill: #1a73e8; }
+[data-dsh-kanban-view] .dk-graph-arrow-head-done { fill: var(--dsw-alias-border-strong, #b0b0b0); }
+[data-dsh-kanban-view] .dk-graph-node {
+  position: absolute; box-sizing: border-box; display: flex; flex-direction: column;
+  justify-content: center; gap: 4px; overflow: hidden; cursor: pointer;
+  background: var(--dsw-alias-bg-base, #ffffff); border: 1px solid var(--dsw-alias-border, #e0e0e0);
+  border-radius: 8px; padding: 6px 8px;
+}
+[data-dsh-kanban-view] .dk-graph-node:hover { border-color: var(--dsw-alias-border-strong, #999); }
+[data-dsh-kanban-view] .dk-graph-node-blocked { border-left: 3px solid #b3261e; }
+[data-dsh-kanban-view] .dk-graph-node-done { opacity: 0.6; }
+[data-dsh-kanban-view] .dk-graph-node-title {
+  font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+[data-dsh-kanban-view] .dk-graph-node-badges { display: flex; gap: 4px; }
+
 /* Lightweight markdown subset (plan preview). */
 [data-dsh-kanban-view] .dk-md { font-size: 13px; line-height: 1.6; word-break: break-word; }
 [data-dsh-kanban-view] .dk-md h4, [data-dsh-kanban-view] .dk-md h5, [data-dsh-kanban-view] .dk-md h6 {

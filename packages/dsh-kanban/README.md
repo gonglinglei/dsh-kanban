@@ -4,7 +4,7 @@
 双半身插件，不改 DSH 源码：
 
 - **Host 半身**（`src/index.ts`，跑在 dsh host 进程）：项目账本、状态机、
-  递归任务拆解与依赖调度、会话拉起与轮询结算（apiProxy）、stale 定时器、
+  递归任务拆解与依赖调度、会话拉起与轮询结算（Session Controller）、stale 定时器、
   webserver 路由（`/kanban/*`）与 system-prompt 通告。
 - **Browser 半身**（`src/client/`，经 `/plugins/ui-kanban/client.js` 由 web GUI
   伺服）：侧边栏「看板」入口 + 中心列 DOM 挂载的看板视图（7 列状态、项目卡
@@ -46,8 +46,10 @@ host-routes / spawner / session-runner / decomposition）+ browser 侧 jsdom
 |---|---|---|
 | Host 服务 | `ctx.webServer.register(route)`、`ctx.systemPrompt.section` | `dsh-task-board/src/index.ts` |
 | 桥 | 同源 HTTP：`GET /kanban/state`、`POST /kanban/action`、`GET /kanban/file`、`GET /kanban/health` + SSE `GET /kanban/events`（15s 心跳，全量快照推送；visibilitychange 重拉兜底） | `host-routes.ts` / `host-api.ts` |
-| 会话执行 | apiProxy 拉起会话（create + rename + queue prompt），5s 轮询 turn/end 结算；失败/取消/缺产物 → blocked；host 重启后 refire 阶段钩子并续跑已挂会话 | `core/execution.ts` |
+| 会话执行 | Session Controller 拉起会话（create + rename + queue prompt），5s 轮询 turn/end 结算；失败/取消/缺产物 → blocked；host 重启后 refire 阶段钩子并续跑已挂会话 | `core/execution.ts` |
 | 任务拆解 | 设计 agent 可选写 `tasks.json`（clarify/research/design/execute，任意嵌套 + dependsOn）；人确认后物化为叶任务，依赖就绪才拉起，全部叶完成则项目完成 | — |
+| 任务终止/删除 | 任务级人工动作 `terminate-task`（尽力取消会话 + 置 blocked 留痕）与 `delete-task`（取消会话 + 移除叶子 + 解除依赖引用 + 清产物 + 重算项目完成度）；删除项目级联取消其全部会话（防泄漏）。capability `task-terminate-delete` 握手，老 host 不暴露按钮 | — |
+| 依赖关系图 | 项目详情页「子任务」区的依赖关系图视图（自绘分层布局 + SVG 连线，零新增依赖）：节点为任务叶（标题 + 类型 + 状态徽标），有向边从依赖方指向被依赖方，已完成依赖的连线弱化；「列表 / 依赖图」可切换，点击节点跳转任务详情 | `dep-graph-layout.ts` / `dep-graph.tsx` |
 | UI 挂载 | 侧边栏 DOM 注入 + 中心列 DOM 接管（`data-*` 切换） | `sidebar-entry-core.ts` / `board-mount.tsx` |
 
 ## 状态机
@@ -70,6 +72,12 @@ Actor 策略：`human` 任意→任意（人始终是最终裁决者）；`agent
 依赖调度：任务叶的会话只在其 dependsOn 全部 done 后拉起；execute 叶额外等待
 项目的全部 clarify 叶完成（澄清问答注入执行 prompt）。
 
+任务级人工控制（capability `task-terminate-delete` 门控，老 host 不显示按钮）：
+「终止」= 软停止（尽力取消会话后任意非 blocked 态 → blocked，历史留痕「人工终止」，
+被终止的叶子不会再被自动拉起，项目也不会因此自动完成）；「删除」= 硬移除
+（任意状态可删：取消会话、从账本移除、解除兄弟叶子的依赖引用并留痕、清理
+`artifacts/<taskId>.md`、删除最后一个未完成叶子后项目自动推导为 done）。
+
 ## 数据与产物
 
 - **账本**：`<DSH_HOME>/kanban/projects.json`（`DSH_HOME` 默认 `~/.dsh`，可用
@@ -79,6 +87,12 @@ Actor 策略：`human` 任意→任意（人始终是最终裁决者）；`agent
   `plan.md`（设计方案）、`tasks.json`（可选拆解清单）、`artifacts/<taskId>.md`
   （research/design 叶产物）。同一 workspaceDir 下多项目互不覆盖；新一轮设计
   清空本项目目录；删除项目连带删除目录。
+- **关联项目的工作目录继承**：新建一次性项目时选中「关联长期项目」即免选工作
+  目录——host 强制以父项目当前的 `workspaceDir` 作为子项目目录（调用方另传的
+  值一律忽略，host 是该不变量的唯一事实源），创建历史以
+  `created (workspace inherited from parent)` 留痕。协议面由 capability
+  `parent-workspace-inheritance` 握手：无该能力的老 host 下，客户端退回「自动
+  预填父项目目录、保持可编辑」的旧协议行为，两边组合均不报错。
 
 ## 配置项
 

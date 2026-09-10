@@ -10,8 +10,10 @@
  */
 import { useEffect, useSyncExternalStore, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { Actor, Project, ProjectStatus, TaskKind, TaskNode } from '../protocol.ts'
-import { CAPABILITY_LONG_RUNNING_PROJECTS } from '../protocol.ts'
+import type { Project, ProjectStatus, TaskNode } from '../protocol.ts'
+import { CAPABILITY_LONG_RUNNING_PROJECTS, CAPABILITY_PARENT_WORKSPACE_INHERITANCE, CAPABILITY_TASK_TERMINATE_DELETE } from '../protocol.ts'
+import { DependencyGraph } from './dep-graph.tsx'
+import { ACTOR_LABELS, KIND_LABELS, STATUS_LABELS } from './labels.ts'
 import { rememberWorkspaceDir } from './last-workspace-dir.ts'
 import type { BoardStore } from './store.ts'
 import { closeBoard } from './view-state.ts'
@@ -26,31 +28,8 @@ const COLUMNS: ReadonlyArray<{ status: ProjectStatus; label: string }> = [
   { status: 'done', label: '已完成' },
 ]
 
-/** Chinese labels for every board status (detail view badges and history timeline). */
-const STATUS_LABELS: Record<ProjectStatus, string> = {
-  backlog: '待开始',
-  designing: '设计中',
-  'awaiting-clarification': '待澄清',
-  'awaiting-review': '待确认',
-  executing: '执行中',
-  blocked: '阻塞',
-  done: '已完成',
-}
-
-/** Chinese labels for history actors. */
-const ACTOR_LABELS: Record<Actor, string> = {
-  human: '人工',
-  agent: 'agent',
-  system: '系统',
-}
-
-/** Chinese labels for the four task kinds. */
-const KIND_LABELS: Record<TaskKind, string> = {
-  clarify: '澄清',
-  research: '调研',
-  design: '设计',
-  execute: '执行',
-}
+/** Chinese labels for every board status, history actors, and task kinds
+ * now live in labels.ts (shared with the dependency-graph view). */
 
 /** Epoch millis → locale string (detail view timestamps). */
 function formatTime(at: number): string {
@@ -117,6 +96,13 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
   // on create-project, so the client must not offer「长期执行中的项目」
   // unless the running host declares the capability. Absent = too old.
   const supportsLongRunning = snapshot.capabilities?.includes(CAPABILITY_LONG_RUNNING_PROJECTS) ?? false
+  // Same handshake pattern for affiliated workspace inheritance: only a host
+  // declaring the capability gets the omit-the-dir form; older hosts get the
+  // pre-filled, still-editable dir input (they accept the value as-is).
+  const supportsParentInheritance = snapshot.capabilities?.includes(CAPABILITY_PARENT_WORKSPACE_INHERITANCE) ?? false
+  // Same handshake pattern for task-level terminate/delete: only a host
+  // declaring the capability gets the buttons (an old host would 400 them).
+  const supportsTaskTerminateDelete = snapshot.capabilities?.includes(CAPABILITY_TASK_TERMINATE_DELETE) ?? false
 
   if (detailTask !== undefined) {
     return (
@@ -127,6 +113,7 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
           waitingFor={waitingForTitles(detailTask, snapshot.tasks)}
           store={store}
           backLabel={detailId === null ? '返回看板' : '返回项目'}
+          supportsTaskTerminateDelete={supportsTaskTerminateDelete}
           onBack={() => { setDetailTaskId(null) }}
           onAction={action => { void store.apply(action) }}
           onOpenSession={openSession}
@@ -180,6 +167,7 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
                       task={task}
                       projectTitle={snapshot.projects.find(project => project.id === task.projectId)?.title ?? ''}
                       waitingFor={waitingForTitles(task, snapshot.tasks)}
+                      supportsTaskTerminateDelete={supportsTaskTerminateDelete}
                       onAction={action => { void store.apply(action) }}
                       onOpenSession={openSession}
                       onOpenDetail={() => { setDetailTaskId(task.id) }}
@@ -212,9 +200,10 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
         <NewProjectModal
           getDefaultWorkspaceDir={getDefaultWorkspaceDir}
           supportsLongRunning={supportsLongRunning}
+          supportsParentInheritance={supportsParentInheritance}
           parents={snapshot.projects
             .filter(project => project.lifecycle === 'long-running')
-            .map(project => ({ id: project.id, title: project.title }))}
+            .map(project => ({ id: project.id, title: project.title, workspaceDir: project.workspaceDir }))}
           onCancel={() => { setCreating(false) }}
           onCreate={input => {
             setCreating(false)
@@ -222,7 +211,11 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
               await store.apply({ kind: 'create-project', ...input })
               // apply swallows failures into lastError; a rejected dir is
               // not worth remembering, so only persist on success.
-              if (store.getError() === null) rememberWorkspaceDir(input.workspaceDir)
+              // An affiliated create omits workspaceDir (the host inherits
+              // the parent's): the inherited value must NOT clobber
+              // last-workspace-dir, whose semantics are "the dir the user
+              // last picked by hand".
+              if (store.getError() === null && input.workspaceDir !== undefined) rememberWorkspaceDir(input.workspaceDir)
             })()
           }}
         />
@@ -298,13 +291,15 @@ interface TaskCardProps {
   projectTitle: string
   /** Titles of not-yet-done dependencies this leaf is waiting on. */
   waitingFor: string[]
+  /** Host capability handshake: old hosts 400 terminate/delete, so hide the buttons. */
+  supportsTaskTerminateDelete: boolean
   onAction(action: Parameters<BoardStore['apply']>[0]): void
   onOpenSession(sessionId: string): void
   onOpenDetail(): void
 }
 
 /** One decomposed task leaf: level-indented title, kind badge, and kind-specific actions. */
-function TaskCard({ task, projectTitle, waitingFor, onAction, onOpenSession, onOpenDetail }: TaskCardProps): JSX.Element {
+function TaskCard({ task, projectTitle, waitingFor, supportsTaskTerminateDelete, onAction, onOpenSession, onOpenDetail }: TaskCardProps): JSX.Element {
   const segments = task.titlePath.split(' > ')
   const level = segments.length - 1
   const [answerDraft, setAnswerDraft] = useState('')
@@ -357,6 +352,18 @@ function TaskCard({ task, projectTitle, waitingFor, onAction, onOpenSession, onO
           <button className="dk-btn dk-btn-ghost" onClick={handleOpenSession}>打开会话</button>
         )}
         <button className="dk-btn dk-btn-ghost" onClick={onOpenDetail}>详情</button>
+        {supportsTaskTerminateDelete && (task.status === 'designing' || task.status === 'executing') && (
+          <button
+            className="dk-btn dk-btn-ghost"
+            onClick={() => { onAction({ kind: 'terminate-task', projectId: task.projectId, taskId: task.id }) }}
+          >终止</button>
+        )}
+        {supportsTaskTerminateDelete && (
+          <button
+            className="dk-btn dk-btn-ghost"
+            onClick={() => { if (globalThis.confirm(`删除任务「${task.titlePath.split(' > ').at(-1)}」？`)) onAction({ kind: 'delete-task', projectId: task.projectId, taskId: task.id }) }}
+          >删除</button>
+        )}
       </div>
       {openError !== null && <p className="dk-card-error">无法打开会话：{openError}</p>}
     </article>
@@ -391,6 +398,13 @@ function ProjectDetail({ project, tasks, parentTitle, childProjects, store, onBa
   const { openError, open } = useOpenSession(onOpenSession)
   const [plan, setPlan] = useState<{ state: 'loading' | 'loaded' | 'error'; text?: string; error?: string } | null>(null)
   const planPath = project.planPath
+  // 子任务 section view switch. The lazy initializer only runs on mount, so
+  // a later snapshot refresh never resets a manual choice; the default is
+  // the graph only when it would actually show a structure (≥ 2 tasks and
+  // at least one dependency edge), otherwise the familiar list.
+  const [tasksView, setTasksView] = useState<'list' | 'graph'>(() =>
+    tasks.length >= 2 && tasks.some(task => task.dependencies.length > 0) ? 'graph' : 'list'
+  )
 
   // Fetch the plan artifact on demand; it deliberately stays out of the
   // snapshot (the file can be large and changes outside the ledger).
@@ -460,8 +474,24 @@ function ProjectDetail({ project, tasks, parentTitle, childProjects, store, onBa
         </section>
 
         <section className="dk-detail-section">
-          <h3 className="dk-detail-heading">子任务({tasks.length})</h3>
-          {tasks.length === 0 ? <p className="dk-empty">尚无子任务</p> : tasks.map(task => (
+          <div className="dk-detail-heading-row">
+            <h3 className="dk-detail-heading">子任务({tasks.length})</h3>
+            {tasks.length > 0 && (
+              <div className="dk-view-toggle">
+                <button
+                  className={tasksView === 'list' ? 'dk-btn dk-btn-primary' : 'dk-btn'}
+                  onClick={() => { setTasksView('list') }}
+                >列表</button>
+                <button
+                  className={tasksView === 'graph' ? 'dk-btn dk-btn-primary' : 'dk-btn'}
+                  onClick={() => { setTasksView('graph') }}
+                >依赖图</button>
+              </div>
+            )}
+          </div>
+          {tasks.length === 0 ? <p className="dk-empty">尚无子任务</p> : tasksView === 'graph' ? (
+            <DependencyGraph tasks={tasks} onOpenTaskDetail={onOpenTaskDetail} />
+          ) : tasks.map(task => (
             <div className="dk-detail-task" key={task.id}>
               <div className="dk-card-meta">
                 <span className="dk-kind-badge">{KIND_LABELS[task.kind]}</span>
@@ -547,6 +577,8 @@ interface TaskDetailProps {
   store: BoardStore
   /**「返回看板」when opened from the columns,「返回项目」when opened from a project detail. */
   backLabel: string
+  /** Host capability handshake: old hosts 400 terminate/delete, so hide the buttons. */
+  supportsTaskTerminateDelete: boolean
   onBack(): void
   onAction(action: Parameters<BoardStore['apply']>[0]): void
   onOpenSession(sessionId: string): void
@@ -561,7 +593,7 @@ interface TaskDetailProps {
  * the task-level transition history, and the same status-specific actions
  * as the card.
  */
-function TaskDetail({ task, projectTitle, waitingFor, store, backLabel, onBack, onAction, onOpenSession }: TaskDetailProps): JSX.Element {
+function TaskDetail({ task, projectTitle, waitingFor, store, backLabel, supportsTaskTerminateDelete, onBack, onAction, onOpenSession }: TaskDetailProps): JSX.Element {
   const [answerDraft, setAnswerDraft] = useState('')
   const { openError, open } = useOpenSession(onOpenSession)
   const [artifact, setArtifact] = useState<{ state: 'loading' | 'loaded' | 'error'; text?: string; error?: string } | null>(null)
@@ -694,6 +726,23 @@ function TaskDetail({ task, projectTitle, waitingFor, store, backLabel, onBack, 
             {task.sessionId !== undefined && (
               <button className="dk-btn dk-btn-ghost" onClick={handleOpenSession}>打开会话</button>
             )}
+            {supportsTaskTerminateDelete && (task.status === 'designing' || task.status === 'executing') && (
+              <button
+                className="dk-btn dk-btn-ghost"
+                onClick={() => { onAction({ kind: 'terminate-task', projectId: task.projectId, taskId: task.id }) }}
+              >终止</button>
+            )}
+            {supportsTaskTerminateDelete && (
+              <button
+                className="dk-btn dk-btn-ghost"
+                onClick={() => {
+                  if (!globalThis.confirm(`删除任务「${task.titlePath.split(' > ').at(-1)}」？`)) return
+                  onAction({ kind: 'delete-task', projectId: task.projectId, taskId: task.id })
+                  // The task is gone after a delete; fall back like the project detail does.
+                  onBack()
+                }}
+              >删除</button>
+            )}
           </div>
         </section>
       </div>
@@ -792,7 +841,12 @@ function RejectForm({ projectId, onSubmit }: { projectId: string; onSubmit(feedb
 
 export interface NewProjectInput {
   title: string
-  workspaceDir: string
+  /**
+   * Omitted on an affiliated create against an inheritance-capable host —
+   * the host fills it with the parent's directory (a stale snapshot value
+   * would only risk inconsistency).
+   */
+  workspaceDir?: string
   goal: string
   /** 'long-running' creates a long-running board container; absent means one-shot. */
   lifecycle?: 'long-running'
@@ -800,13 +854,14 @@ export interface NewProjectInput {
   parentId?: string
 }
 
-/** One option of the modal's「关联长期项目」select (id + display title). */
+/** One option of the modal's「关联长期项目」select (id + display title + the dir an affiliated child would inherit). */
 export interface ParentOption {
   id: string
   title: string
+  workspaceDir: string
 }
 
-function NewProjectModal({ getDefaultWorkspaceDir, supportsLongRunning, parents, onCancel, onCreate }: {
+function NewProjectModal({ getDefaultWorkspaceDir, supportsLongRunning, supportsParentInheritance, parents, onCancel, onCreate }: {
   getDefaultWorkspaceDir(): string
   /**
    * Whether the running host declared the long-running-projects capability.
@@ -815,6 +870,14 @@ function NewProjectModal({ getDefaultWorkspaceDir, supportsLongRunning, parents,
    * host understands (its parser silently drops unknown fields).
    */
   supportsLongRunning: boolean
+  /**
+   * Whether the running host declared the parent-workspace-inheritance
+   * capability. When true, selecting a parent replaces the dir input with a
+   * read-only inheritance hint and the submit omits workspaceDir; when false
+   * (older host), selecting a parent merely pre-fills the (still editable)
+   * dir input with the parent's directory — a plain old-protocol create.
+   */
+  supportsParentInheritance: boolean
   /** The snapshot's long-running projects, offered as affiliation targets. */
   parents: ParentOption[]
   onCancel(): void
@@ -824,27 +887,35 @@ function NewProjectModal({ getDefaultWorkspaceDir, supportsLongRunning, parents,
   // ready when the board mounted, so the default must be read live.
   const [title, setTitle] = useState('')
   const [workspaceDir, setWorkspaceDir] = useState(() => getDefaultWorkspaceDir())
+  // Tracks whether the user hand-edited the dir input: the old-host parent
+  // pre-fill only overwrites an untouched (default) value, never user input.
+  const [dirEdited, setDirEdited] = useState(false)
   const [goal, setGoal] = useState('')
   const [longRunning, setLongRunning] = useState(false)
   const [parentId, setParentId] = useState('')
   const [submitError, setSubmitError] = useState<string | null>(null)
-  const valid = title.trim() !== '' && workspaceDir.trim() !== '' && goal.trim() !== ''
+  const affiliated = !longRunning && parentId !== ''
+  const selectedParent = affiliated ? parents.find(parent => parent.id === parentId) : undefined
+  const inheritsDir = affiliated && supportsParentInheritance
+  const valid = title.trim() !== '' && goal.trim() !== '' && (inheritsDir || workspaceDir.trim() !== '')
 
   const submit = (): void => {
     if (!valid) {
       // A disabled button looks exactly like an enabled one in this skin;
       // always accept the click and explain why nothing was created.
-      setSubmitError('请填写项目名称、工作目录和目标')
+      setSubmitError(inheritsDir ? '请填写项目名称和目标' : '请填写项目名称、工作目录和目标')
       return
     }
     // Omit the optional keys entirely when unset so the action envelope
-    // stays byte-identical to a pre-feature one-shot create.
+    // stays byte-identical to a pre-feature one-shot create. An affiliated
+    // create against an inheritance-capable host also omits workspaceDir:
+    // the host is the source of truth for the inherited directory.
     onCreate({
       title: title.trim(),
-      workspaceDir: workspaceDir.trim(),
+      ...(inheritsDir ? {} : { workspaceDir: workspaceDir.trim() }),
       goal: goal.trim(),
       ...(longRunning ? { lifecycle: 'long-running' as const } : {}),
-      ...(!longRunning && parentId !== '' ? { parentId } : {}),
+      ...(affiliated ? { parentId } : {}),
     })
   }
 
@@ -871,10 +942,17 @@ function NewProjectModal({ getDefaultWorkspaceDir, supportsLongRunning, parents,
           <label htmlFor="dk-title">项目名称</label>
           <input id="dk-title" value={title} placeholder="例如：重构看板后端" onChange={event => { setTitle(event.target.value); setSubmitError(null) }} />
         </div>
-        <div className="dk-field">
-          <label htmlFor="dk-workspace">工作目录（agent 在此执行）</label>
-          <input id="dk-workspace" value={workspaceDir} placeholder="/path/to/workspace" onChange={event => { setWorkspaceDir(event.target.value); setSubmitError(null) }} />
-        </div>
+        {inheritsDir ? (
+          <div className="dk-field">
+            <label>工作目录（agent 在此执行）</label>
+            <p className="dk-card-goal">将使用父项目的目录 <code>{selectedParent?.workspaceDir ?? ''}</code></p>
+          </div>
+        ) : (
+          <div className="dk-field">
+            <label htmlFor="dk-workspace">工作目录（agent 在此执行）</label>
+            <input id="dk-workspace" value={workspaceDir} placeholder="/path/to/workspace" onChange={event => { setWorkspaceDir(event.target.value); setDirEdited(true); setSubmitError(null) }} />
+          </div>
+        )}
         <div className="dk-field">
           <label htmlFor="dk-goal">项目目标（一句话）</label>
           <input id="dk-goal" value={goal} placeholder="例如：把任务看板的后端迁移到 SQLite" onChange={event => { setGoal(event.target.value); setSubmitError(null) }} />
@@ -882,7 +960,24 @@ function NewProjectModal({ getDefaultWorkspaceDir, supportsLongRunning, parents,
         {supportsLongRunning && !longRunning && (
           <div className="dk-field">
             <label htmlFor="dk-parent">关联长期项目（可选）</label>
-            <select id="dk-parent" value={parentId} onChange={event => { setParentId(event.target.value); setSubmitError(null) }}>
+            <select
+              id="dk-parent"
+              value={parentId}
+              onChange={event => {
+                const next = event.target.value
+                setParentId(next)
+                setSubmitError(null)
+                // Old-host fallback: without the inheritance capability the
+                // dir input stays visible and required, so pre-fill it with
+                // the parent's directory (still editable — the submit then
+                // is a plain old-protocol create the host accepts as-is).
+                // Never clobber a dir the user typed by hand.
+                if (!supportsParentInheritance && next !== '' && !dirEdited) {
+                  const parent = parents.find(candidate => candidate.id === next)
+                  if (parent !== undefined) setWorkspaceDir(parent.workspaceDir)
+                }
+              }}
+            >
               <option value="">不关联</option>
               {parents.map(parent => <option key={parent.id} value={parent.id}>{parent.title}</option>)}
             </select>

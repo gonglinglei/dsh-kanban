@@ -1,26 +1,17 @@
 /**
- * Kanban session runner: drives real dsh sessions through the host API
- * proxy (the dsh-web-ui task-board HostExecutionRunner pattern, Apache-2.0).
+ * Kanban session runner: drives real dsh sessions through the host Session
+ * Controller.
  *
- * Launch = sessions.create (with cwd) + rename + prompt(mode:'queue').
- * Completion = polling sessions.history for the first turn/end event after
+ * Launch = create (with cwd) + rename + prompt(mode:'queue').
+ * Completion = inspecting the Session event log for the first turn/end after
  * the launch timestamp; a turn/end whose data.reason.kind is 'error' is a
  * failure. The poll loop lives in spawner.ts.
  */
 import { existsSync, mkdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
+import type { SessionController, SessionRequestId } from '@deepseek-ai/dsh-api-session-controller'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { Project, TaskNode } from './protocol.ts'
-
-/** One RPC request (rpcId echoes back in the response). */
-export interface KanbanRpcRequest<T> {
-  rpcId: string
-  payload: T
-}
-
-/** One RPC response (the narrow shape the runner needs). */
-export type KanbanRpcResponse<T> =
-  | { result: { ok: true; value: T } }
-  | { result: { ok: false; error: { code: string; message: string } } }
 
 /** One session-list row (the narrow slice the runner inspects). */
 export interface KanbanSessionSummary {
@@ -36,15 +27,15 @@ export interface KanbanHistoryEvent {
   event: { type: string; seq?: number; time?: number; data: unknown }
 }
 
-/** The host API surface the runner uses (a structural slice of ctx.apiProxy). */
+/** The host Session Controller surface the runner uses. */
 export interface KanbanApi {
-  sessions: {
-    create(request: KanbanRpcRequest<{ cwd?: string; workspaceId?: string; agentPreset?: string }>): Promise<KanbanRpcResponse<{ sessionId: string }>>
-    rename(request: KanbanRpcRequest<{ sessionId: string; title: string }>): Promise<KanbanRpcResponse<unknown>>
-    prompt(request: KanbanRpcRequest<{ sessionId: string; mode: 'queue'; content: Array<{ type: 'text'; text: string }> }>): Promise<KanbanRpcResponse<unknown>>
-    list(request: KanbanRpcRequest<unknown>): Promise<KanbanRpcResponse<{ items: KanbanSessionSummary[] }>>
-    history(request: KanbanRpcRequest<{ sessionId: string; maxMessages?: number; beforeSeq?: number }>): Promise<KanbanRpcResponse<{ events: KanbanHistoryEvent[]; hasMore: boolean }>>
-  }
+  create(request: { cwd?: string; agentPreset?: string }): Promise<{ sessionId: string }>
+  rename(request: { sessionId: string; title: string }): Promise<unknown>
+  prompt(request: { requestId: string; sessionId: string; mode: 'queue'; content: Array<{ type: 'text'; text: string }> }): Promise<unknown>
+  list(request: { cursor?: string }): Promise<{ items: readonly KanbanSessionSummary[] }>
+  inspect(sessionId: string): Promise<{ events: readonly KanbanHistoryEvent[] }>
+  /** Stop the session's active turn. */
+  cancel(request: { sessionId: string }): Promise<unknown>
 }
 
 /** One execution's resolved outcome. */
@@ -62,12 +53,32 @@ export class SessionLaunchError extends Error {
   }
 }
 
-function request<T>(payload: T): KanbanRpcRequest<T> {
-  return { rpcId: `kanban-${crypto.randomUUID()}`, payload }
+/**
+ * Adapt the branded current Session Controller contract to the small,
+ * string-based surface persisted by the kanban ledger.
+ */
+export function createKanbanApi(controller: SessionController): KanbanApi {
+  const sessionId = (value: string): SessionId => value as SessionId
+  const signal = (): AbortSignal => new AbortController().signal
+  return {
+    create: async request => controller.create(request),
+    rename: async request => controller.rename({ ...request, sessionId: sessionId(request.sessionId) }),
+    prompt: async request => controller.prompt({
+      ...request,
+      requestId: request.requestId as SessionRequestId,
+      sessionId: sessionId(request.sessionId),
+    }, signal()),
+    list: async request => controller.list(request, signal()),
+    inspect: async value => {
+      const inspection = await controller.inspect(sessionId(value), signal())
+      return { events: inspection.events.map(event => ({ event })) }
+    },
+    cancel: async request => controller.cancel({ sessionId: sessionId(request.sessionId) }),
+  }
 }
 
-function failure(error: { code: string; message: string }): Error {
-  return new Error(`${error.code}: ${error.message}`)
+function requestId(): string {
+  return `kanban-${crypto.randomUUID()}`
 }
 
 function isErrorTurnEnd(data: unknown): boolean {
@@ -349,12 +360,12 @@ export class KanbanSessionRunner {
   /** Prompt an already-attached session (project or task leaf) with the given text. */
   async resumeTaskSession(sessionId: string, text: string): Promise<string> {
     try {
-      const prompted = await this.api.sessions.prompt(request({
+      await this.api.prompt({
+        requestId: requestId(),
         sessionId,
         mode: 'queue',
         content: [{ type: 'text', text }],
-      }))
-      if (!prompted.result.ok) throw failure(prompted.result.error)
+      })
     } catch (error) {
       throw new SessionLaunchError(sessionId, error)
     }
@@ -375,31 +386,41 @@ export class KanbanSessionRunner {
     // before it can write plan.md.
     mkdirSync(project.workspaceDir, { recursive: true })
     mkdirSync(projectDir(project), { recursive: true })
-    const created = await this.api.sessions.create(request({ cwd: project.workspaceDir }))
-    if (!created.result.ok) throw failure(created.result.error)
-    const sessionId = created.result.value.sessionId
+    const created = await this.api.create({ cwd: project.workspaceDir })
+    const sessionId = created.sessionId
     try {
-      const renamed = await this.api.sessions.rename(request({ sessionId, title }))
-      if (!renamed.result.ok) throw failure(renamed.result.error)
-      const prompted = await this.api.sessions.prompt(request({
+      await this.api.rename({ sessionId, title })
+      await this.api.prompt({
+        requestId: requestId(),
         sessionId,
         mode: 'queue',
         content: [{ type: 'text', text: promptText }],
-      }))
-      if (!prompted.result.ok) throw failure(prompted.result.error)
+      })
     } catch (error) {
       throw new SessionLaunchError(sessionId, error)
     }
     return sessionId
   }
 
+  /**
+   * Best-effort cancel of a session's active turn. Every failure is
+   * swallowed: the session may already have ended (or never existed on this
+   * host), and a kanban terminate/delete must never be blocked by the RPC.
+   */
+  async cancelSession(sessionId: string): Promise<void> {
+    try {
+      await this.api.cancel({ sessionId })
+    } catch {
+      // Best-effort semantics: the board state change commits regardless.
+    }
+  }
+
   /** Count of running sessions (one sessions.list RPC per poll tick). */
   async listRunning(): Promise<{ known: true; count: number; items: KanbanSessionSummary[] } | { known: false }> {
     try {
-      const response = await this.api.sessions.list(request({}))
-      return response.result.ok
-        ? { known: true, count: response.result.value.items.filter(item => item.running).length, items: response.result.value.items }
-        : { known: false }
+      const response = await this.api.list({})
+      const items = [...response.items]
+      return { known: true, count: items.filter(item => item.running).length, items }
     } catch {
       return { known: false }
     }
@@ -417,40 +438,16 @@ export class KanbanSessionRunner {
     if (sessions !== undefined) {
       items = sessions
     } else {
-      const response = await this.api.sessions.list(request({}))
-      if (!response.result.ok) return { outcome: 'pending' }
-      items = response.result.value.items
+      try {
+        items = (await this.api.list({})).items
+      } catch {
+        return { outcome: 'pending' }
+      }
     }
     const summary = items.find(item => item.sessionId === sessionId)
     if (summary === undefined) return { outcome: 'cancelled', error: 'execution session no longer exists' }
     if (summary.running) return { outcome: 'pending' }
-    const events: KanbanHistoryEvent[] = []
-    let beforeSeq: number | undefined
-    let reachedExecutionBoundary = false
-    for (let page = 0; page < 100; page += 1) {
-      const history = await this.api.sessions.history(request({
-        sessionId: summary.sessionId,
-        maxMessages: 100,
-        ...(beforeSeq === undefined ? {} : { beforeSeq }),
-      }))
-      if (!history.result.ok) return { outcome: 'pending' }
-      events.push(...history.result.value.events)
-      const oldestTime = history.result.value.events.reduce<number | undefined>((oldest, entry) => {
-        const time = entry.event.time
-        return typeof time !== 'number' ? oldest : oldest === undefined ? time : Math.min(oldest, time)
-      }, undefined)
-      if (!history.result.value.hasMore || (oldestTime !== undefined && oldestTime <= startedAt)) {
-        reachedExecutionBoundary = true
-        break
-      }
-      const oldestSeq = history.result.value.events.reduce<number | undefined>((oldest, entry) => {
-        const seq = entry.event.seq
-        return typeof seq !== 'number' ? oldest : oldest === undefined ? seq : Math.min(oldest, seq)
-      }, undefined)
-      if (oldestSeq === undefined || oldestSeq === beforeSeq) return { outcome: 'pending' }
-      beforeSeq = oldestSeq
-    }
-    if (!reachedExecutionBoundary) return { outcome: 'pending' }
+    const events = [...(await this.api.inspect(summary.sessionId)).events]
     const turnEnd = events
       .filter(entry => entry.event.type === 'turn/end' && (
         startedAt <= 0 || (typeof entry.event.time === 'number' && entry.event.time >= startedAt)

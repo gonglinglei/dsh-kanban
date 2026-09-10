@@ -11,7 +11,10 @@
  * shell fails the whole boot when a plugin apply throws, and an external
  * plugin must not take the GUI down.
  */
-import type { ClientContext, ISessions, IWorkspaces, SessionId } from '@deepseek-ai/dsh-client-runtime/client'
+import type { Context } from '@deepseek-ai/cordis'
+import type { ISessions } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { IWorkspaces } from '@deepseek-ai/dsh-api-workspace-controller/client'
+import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { mountBoard } from './board-mount.tsx'
 import { HttpKanbanHostTransport } from './host-api.ts'
 import { defaultWorkspaceDir } from './last-workspace-dir.ts'
@@ -28,7 +31,7 @@ export const inject = ['sessions', 'workspaces']
  * Mount the kanban surfaces.
  * @param ctx - client root context (sessions, workspaces).
  */
-export function apply(ctx: ClientContext): void {
+export function apply(ctx: Context): void {
   if (applied) return
   applied = true
   // Release the claim when this fiber unloads (the loader supports plugin

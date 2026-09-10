@@ -66,7 +66,7 @@ async function callFileRoute(req: IncomingMessage): Promise<FakeResponse> {
 }
 
 describe('GET /kanban/state', () => {
-  it('declares the long-running-projects capability on every snapshot (client handshake)', async () => {
+  it('declares the host capabilities on every snapshot (client handshake)', async () => {
     const route = makeKanbanRoutes(service).find(candidate => candidate.path === '/kanban/state')
     expect(route, 'the /kanban/state route must be registered').toBeDefined()
     const { res, result } = fakeResponse()
@@ -76,7 +76,7 @@ describe('GET /kanban/state', () => {
     const snapshot = (response.body as { snapshot: { capabilities?: string[] } }).snapshot
     // The client treats a missing capabilities field as「host too old」and
     // hides the long-running entry; this field must always be present.
-    expect(snapshot.capabilities).toEqual(['long-running-projects'])
+    expect(snapshot.capabilities).toEqual(['long-running-projects', 'parent-workspace-inheritance', 'task-terminate-delete'])
   })
 })
 

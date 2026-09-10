@@ -48,9 +48,18 @@ export class KanbanSpawner {
     api: KanbanApi,
     options: KanbanSpawnerOptions = {},
   ) {
-    // The runner's api is structural; the real ctx.apiProxy satisfies it.
+    // The runner receives a narrow adapter over the Host Session Controller.
     this.runner = new KanbanSessionRunner(api)
     this.pollIntervalMs = options.pollIntervalMs ?? SESSION_POLL_MS
+  }
+
+  /**
+   * Best-effort cancel of a session (terminate/delete entry point). Also
+   * drops the launchedAt entry so a later poll tick never settles it.
+   */
+  async cancelSession(sessionId: string): Promise<void> {
+    this.launchedAt.delete(sessionId)
+    await this.runner.cancelSession(sessionId)
   }
 
   /** Wire the phase hooks and start the poll loop; returns the disposer. */

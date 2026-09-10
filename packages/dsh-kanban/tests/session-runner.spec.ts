@@ -220,4 +220,18 @@ describe('KanbanSessionRunner', () => {
     expect(leafPrompt).toContain(expectedPath)
     expect(leafPrompt).toContain('不要重复拆分你正在执行的任务本身')
   })
+
+  it('cancelSession sends the cancel RPC and swallows every failure (best-effort)', async () => {
+    const api = new FakeApi()
+    const runner = new KanbanSessionRunner(api)
+    await runner.cancelSession('sess-1')
+    expect(api.sessions.cancelled).toEqual(['sess-1'])
+
+    // A rejecting cancel RPC must not propagate: the session may already
+    // be gone and the board operation commits regardless.
+    const failing = new FakeApi()
+    failing.sessions.cancel = async () => { throw new Error('cancel boom') }
+    const failingRunner = new KanbanSessionRunner(failing)
+    await expect(failingRunner.cancelSession('sess-gone')).resolves.toBeUndefined()
+  })
 })

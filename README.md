@@ -40,7 +40,7 @@ dsh plugin --profile web add link:$(pwd)/packages/dsh-kanban   # 装进 web prof
       写穿 + 损坏隔离；项目产物按项目隔离在
       `<workspaceDir>/.kanban/projects/<projectId>/`（plan.md / tasks.json /
       artifacts/）
-- [x] 设计/执行 agent 会话拉起（apiProxy）与轮询结算：新建项目自动拉起设计
+- [x] 设计/执行 agent 会话拉起（Session Controller）与轮询结算：新建项目自动拉起设计
       会话，人工确认后拉起执行会话；失败/取消/缺产物自动 Blocked；host 重启
       后自动恢复在跑的会话
 - [x] 确认/驳回 UI 与反馈注入（驳回带反馈，回到同一设计会话继续改）
@@ -49,5 +49,10 @@ dsh plugin --profile web add link:$(pwd)/packages/dsh-kanban   # 装进 web prof
 - [x] clarify 问答（看板上直接向创建人提问，答案注入后续执行叶）
 - [x] 项目详情视图（plan.md Markdown 预览）与任务详情视图（历史时间线、
       依赖等待、跳转 live 会话）
+- [x] 项目详情页子任务依赖关系图视图（分层 DAG：节点为任务叶、有向边为
+      依赖关系，「列表 / 依赖图」可切换，点击节点跳转任务详情）
+- [x] 关联长期项目的一次性项目免选工作目录：host 强制继承父项目目录
+      （capability `parent-workspace-inheritance` 握手，老 host 自动退回
+      预填可编辑行为）
 
 详见 `packages/dsh-kanban/README.md`。

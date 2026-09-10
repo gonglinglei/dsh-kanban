@@ -52,7 +52,9 @@ function applyAction(service: KanbanHostService, action: KanbanAction): unknown 
     case 'create-project':
       return service.createProject({
         title: action.title,
-        workspaceDir: action.workspaceDir,
+        // Optional on affiliated creates (the host inherits the parent's
+        // directory and ignores a caller-supplied value).
+        ...(action.workspaceDir === undefined ? {} : { workspaceDir: action.workspaceDir }),
         goal: action.goal,
         ...(action.lifecycle === undefined ? {} : { lifecycle: action.lifecycle }),
         ...(action.parentId === undefined ? {} : { parentId: action.parentId }),
@@ -70,6 +72,11 @@ function applyAction(service: KanbanHostService, action: KanbanAction): unknown 
       return service.answerClarification(action.projectId, action.taskId, action.answer)
     case 'confirm-task':
       return service.confirmTask(action.projectId, action.taskId)
+    case 'terminate-task':
+      return service.terminateTask(action.projectId, action.taskId, action.note)
+    case 'delete-task':
+      service.deleteTask(action.projectId, action.taskId)
+      return undefined
   }
 }
 

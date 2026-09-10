@@ -9,7 +9,7 @@ import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Project, TaskNode } from '../src/protocol.ts'
-import { CAPABILITY_LONG_RUNNING_PROJECTS } from '../src/protocol.ts'
+import { CAPABILITY_LONG_RUNNING_PROJECTS, CAPABILITY_PARENT_WORKSPACE_INHERITANCE } from '../src/protocol.ts'
 import { Board } from '../src/client/board.tsx'
 import { BoardStore } from '../src/client/store.ts'
 import { isBoardOpen, toggleBoard } from '../src/client/view-state.ts'
@@ -278,6 +278,127 @@ describe('Long-running projects and affiliation', () => {
       goal: '一件事',
     }])
     unmount()
+  })
+})
+
+describe('Parent workspace inheritance', () => {
+  const CAPABLE = [CAPABILITY_LONG_RUNNING_PROJECTS, CAPABILITY_PARENT_WORKSPACE_INHERITANCE]
+
+  it('selecting a parent hides the dir input, shows the inheritance hint, and submits without workspaceDir', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = {
+      revision: 1,
+      capabilities: CAPABLE,
+      projects: [project({ id: 'lp1', title: '长期主线', status: 'executing', lifecycle: 'long-running', workspaceDir: '/parent/dir', sessionId: undefined })],
+      tasks: [],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    await renderBoard(store)
+    await openModal()
+
+    // Before affiliation the editable input is there and required.
+    expect(container.querySelector<HTMLInputElement>('#dk-workspace')).not.toBeNull()
+    await act(async () => {
+      selectOption(container.querySelector<HTMLSelectElement>('#dk-parent')!, 'lp1')
+    })
+    // The input is replaced by the read-only inheritance hint.
+    expect(container.querySelector('#dk-workspace')).toBeNull()
+    expect(container.textContent).toContain('将使用父项目的目录')
+    expect(container.textContent).toContain('/parent/dir')
+
+    await act(async () => {
+      typeInto(container.querySelector<HTMLInputElement>('#dk-title')!, '子项目')
+      typeInto(container.querySelector<HTMLInputElement>('#dk-goal')!, '具体一件事')
+    })
+    const submit = [...container.querySelectorAll('button')].find(button => button.textContent === '创建并开始设计')
+    await act(async () => { submit!.click() })
+    // No workspaceDir key at all: the host inherits it from the parent.
+    expect(transport.actions).toEqual([{
+      kind: 'create-project',
+      title: '子项目',
+      goal: '具体一件事',
+      parentId: 'lp1',
+    }])
+    // The inherited value must not clobber the hand-picked-dir memory.
+    expect(localStorage.getItem('dsh-kanban:last-workspace-dir')).toBeNull()
+  })
+
+  it('deselecting the parent brings the required dir input back', async () => {
+    const transport = new FakeTransport()
+    transport.stateValue = {
+      revision: 1,
+      capabilities: CAPABLE,
+      projects: [project({ id: 'lp1', title: '长期主线', status: 'executing', lifecycle: 'long-running', workspaceDir: '/parent/dir', sessionId: undefined })],
+      tasks: [],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    await renderBoard(store)
+    await openModal()
+    await act(async () => {
+      selectOption(container.querySelector<HTMLSelectElement>('#dk-parent')!, 'lp1')
+    })
+    expect(container.querySelector('#dk-workspace')).toBeNull()
+    await act(async () => {
+      selectOption(container.querySelector<HTMLSelectElement>('#dk-parent')!, '')
+    })
+    expect(container.querySelector<HTMLInputElement>('#dk-workspace')).not.toBeNull()
+
+    // The standalone submit still requires the dir and keeps remembering it.
+    await act(async () => {
+      typeInto(container.querySelector<HTMLInputElement>('#dk-title')!, '独立项目')
+      typeInto(container.querySelector<HTMLInputElement>('#dk-workspace')!, '/path/os')
+      typeInto(container.querySelector<HTMLInputElement>('#dk-goal')!, '一件事')
+    })
+    const submit = [...container.querySelectorAll('button')].find(button => button.textContent === '创建并开始设计')
+    await act(async () => { submit!.click() })
+    expect(transport.actions).toEqual([{
+      kind: 'create-project',
+      title: '独立项目',
+      workspaceDir: '/path/os',
+      goal: '一件事',
+    }])
+    expect(localStorage.getItem('dsh-kanban:last-workspace-dir')).toBe('/path/os')
+  })
+
+  it('an inheritance-incapable host falls back to pre-filling the (editable) parent dir', async () => {
+    const transport = new FakeTransport()
+    // Long-running-capable but pre-inheritance: the intermediate host build.
+    transport.stateValue = {
+      revision: 1,
+      capabilities: [CAPABILITY_LONG_RUNNING_PROJECTS],
+      projects: [project({ id: 'lp1', title: '长期主线', status: 'executing', lifecycle: 'long-running', workspaceDir: '/parent/dir', sessionId: undefined })],
+      tasks: [],
+    }
+    const store = new BoardStore(transport)
+    await store.refresh()
+    await renderBoard(store)
+    await openModal()
+
+    await act(async () => {
+      selectOption(container.querySelector<HTMLSelectElement>('#dk-parent')!, 'lp1')
+    })
+    // The input stays visible and is pre-filled with the parent's directory.
+    const dirInput = container.querySelector<HTMLInputElement>('#dk-workspace')
+    expect(dirInput).not.toBeNull()
+    expect(dirInput!.value).toBe('/parent/dir')
+    expect(container.textContent).not.toContain('将使用父项目的目录')
+
+    await act(async () => {
+      typeInto(container.querySelector<HTMLInputElement>('#dk-title')!, '子项目')
+      typeInto(container.querySelector<HTMLInputElement>('#dk-goal')!, '具体一件事')
+    })
+    const submit = [...container.querySelectorAll('button')].find(button => button.textContent === '创建并开始设计')
+    await act(async () => { submit!.click() })
+    // Old-protocol submit: the dir rides along explicitly, nothing breaks.
+    expect(transport.actions).toEqual([{
+      kind: 'create-project',
+      title: '子项目',
+      workspaceDir: '/parent/dir',
+      goal: '具体一件事',
+      parentId: 'lp1',
+    }])
   })
 })
 

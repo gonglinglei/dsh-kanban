@@ -37,8 +37,8 @@ describe('KanbanHostService', () => {
     // The capability handshake rides every snapshot: the client disables
     // UI the running host does not declare, so this field must never be
     // dropped from /state or /events payloads.
-    expect(service.snapshot().capabilities).toEqual(['long-running-projects'])
-    expect(service.eventPayload().capabilities).toEqual(['long-running-projects'])
+    expect(service.snapshot().capabilities).toEqual(['long-running-projects', 'parent-workspace-inheritance', 'task-terminate-delete'])
+    expect(service.eventPayload().capabilities).toEqual(['long-running-projects', 'parent-workspace-inheritance', 'task-terminate-delete'])
   })
 
   it('fires the onEnterDesigning hook on create and on rejection', () => {
@@ -178,6 +178,34 @@ describe('long-running projects and affiliation', () => {
     expect(child.lifecycle).toBeUndefined()
     // The child still runs the classic one-shot relay.
     expect(child.status).toBe('designing')
+  })
+
+  it('an affiliated project inherits the parent workspaceDir when none is supplied', () => {
+    const service = makeService()
+    const parent = service.createProject({ title: '主线', workspaceDir: '/parent/dir', goal: 'g', lifecycle: 'long-running' })
+    const child = service.createProject({ title: '子项', goal: 'g', parentId: parent.id })
+    expect(child.workspaceDir).toBe('/parent/dir')
+    // The audit trail shows the inheritance happened.
+    expect(child.history[0]?.note).toBe('created (workspace inherited from parent)')
+  })
+
+  it('the parent dir overrides a caller-supplied workspaceDir (host is the source of truth)', () => {
+    const service = makeService()
+    const parent = service.createProject({ title: '主线', workspaceDir: '/parent/dir', goal: 'g', lifecycle: 'long-running' })
+    const child = service.createProject({ title: '子项', workspaceDir: '/stale/snapshot', goal: 'g', parentId: parent.id })
+    expect(child.workspaceDir).toBe('/parent/dir')
+    expect(child.history[0]?.note).toBe('created (workspace inherited from parent)')
+  })
+
+  it('rejects a standalone creation without workspaceDir (double safety behind the parser)', () => {
+    const service = makeService()
+    expect(() => service.createProject({ title: 't', goal: 'g' }))
+      .toThrowError(TransitionError)
+    expect(() => service.createProject({ title: 't', workspaceDir: '  ', goal: 'g' }))
+      .toThrowError(TransitionError)
+    // Long-running projects never inherit either.
+    expect(() => service.createProject({ title: 't', goal: 'g', lifecycle: 'long-running' }))
+      .toThrowError(TransitionError)
   })
 
   it('rejects affiliating to an unknown parent', () => {

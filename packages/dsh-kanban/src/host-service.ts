@@ -16,7 +16,7 @@ import { HOST_CAPABILITIES } from './protocol.ts'
 import type {
   Actor, HistoryEntry, KanbanEventPayload, KanbanSnapshot, Project, ProjectStatus, TaskKind, TaskNode,
 } from './protocol.ts'
-import { DECOMPOSITION_FILE, TASK_ADDITIONS_FILE, decompositionPathFor, projectDir, taskAdditionsPathFor } from './session-runner.ts'
+import { DECOMPOSITION_FILE, TASK_ADDITIONS_FILE, decompositionPathFor, projectDir, taskAdditionsPathFor, taskArtifactPath } from './session-runner.ts'
 import { assertTransitionAllowed, TransitionError } from './state-machine.ts'
 import { emptyState, loadState, saveState, type PersistedState } from './storage.ts'
 
@@ -31,7 +31,13 @@ export const PROJECT_FILE_LIMIT = 512 * 1024
 
 export interface CreateProjectInput {
   title: string
-  workspaceDir: string
+  /**
+   * Working directory the agents execute in. Optional only when parentId is
+   * set — an affiliated one-shot project inherits its parent's directory and
+   * any caller-supplied value is ignored (the host is the single source of
+   * truth for the affiliation/directory invariant).
+   */
+  workspaceDir?: string
   goal: string
   /** 'long-running' creates a long-running board container; absent means one-shot. */
   lifecycle?: 'long-running'
@@ -51,6 +57,13 @@ export type OnEnterTaskDesigning = (task: TaskNode) => void
 /** Hook fired when a task leaf enters executing (execute leaves). */
 export type OnEnterTaskExecuting = (task: TaskNode) => void
 
+/**
+ * Hook fired (fire-and-forget) to cancel a session's active turn; the
+ * spawner wires runner.cancelSession here. Best-effort: failures are
+ * swallowed downstream, the board state change commits regardless.
+ */
+export type OnCancelSession = (sessionId: string) => void
+
 export class KanbanHostService {
   private state: PersistedState = emptyState()
   private readonly listeners = new Set<(payload: KanbanEventPayload) => void>()
@@ -60,6 +73,7 @@ export class KanbanHostService {
   private onEnterExecuting: OnEnterExecuting = () => {}
   private onEnterTaskDesigning: OnEnterTaskDesigning = () => {}
   private onEnterTaskExecuting: OnEnterTaskExecuting = () => {}
+  private onCancelSession: OnCancelSession = () => {}
 
   constructor(private readonly file: string) {}
 
@@ -97,6 +111,25 @@ export class KanbanHostService {
     this.onEnterExecuting = hooks.onEnterExecuting
     this.onEnterTaskDesigning = hooks.onEnterTaskDesigning
     this.onEnterTaskExecuting = hooks.onEnterTaskExecuting
+  }
+
+  /** The spawner wires its session-cancel callback here (default no-op). */
+  setSessionCanceller(cb: OnCancelSession): void {
+    this.onCancelSession = cb
+  }
+
+  /**
+   * Fire-and-forget cancel of an attached session (project or task leaf).
+   * The callback itself is best-effort; terminate/delete/deleteProject call
+   * this before their ledger mutation so a live agent turn stops ASAP.
+   */
+  private cancelAttached(sessionId: string | undefined): void {
+    if (sessionId === undefined) return
+    try {
+      this.onCancelSession(sessionId)
+    } catch {
+      // A throwing hook never blocks the board operation.
+    }
   }
 
   /** Record which session drives a project (metadata commit; no status change). */
@@ -200,6 +233,13 @@ export class KanbanHostService {
    * A one-shot project may affiliate to an existing long-running parent.
    */
   createProject(input: CreateProjectInput): Project {
+    // The affiliation/directory invariant lives here and only here: a child
+    // project ALWAYS runs in its parent's current workspaceDir, whatever the
+    // caller passed. Downstream consumers (session cwd, artifact dirs, the
+    // readProjectFile whitelist) all read project.workspaceDir, so the
+    // inherited value propagates for free.
+    let workspaceDir = input.workspaceDir
+    let inherited = false
     if (input.parentId !== undefined) {
       if (input.lifecycle === 'long-running') {
         throw new TransitionError('long-running projects cannot belong to another project')
@@ -209,12 +249,19 @@ export class KanbanHostService {
       if (parent.lifecycle !== 'long-running') {
         throw new TransitionError(`parent project ${input.parentId} is not a long-running project`)
       }
+      workspaceDir = parent.workspaceDir
+      inherited = true
+    }
+    if (workspaceDir === undefined || workspaceDir.trim() === '') {
+      // Double safety: well-formed traffic is already rejected by the
+      // protocol parser; a direct (non-HTTP) caller gets the same wall.
+      throw new TransitionError('workspaceDir is required when the project has no parent')
     }
     const now = Date.now()
     const project: Project = {
       id: randomUUID(),
       title: input.title,
-      workspaceDir: input.workspaceDir,
+      workspaceDir,
       goal: input.goal,
       status: 'backlog',
       ...(input.lifecycle === undefined ? {} : { lifecycle: input.lifecycle }),
@@ -226,7 +273,7 @@ export class KanbanHostService {
       history: [],
     }
     this.state.projects.push(project)
-    this.commit(project, 'system', 'backlog', 'backlog', 'created')
+    this.commit(project, 'system', 'backlog', 'backlog', inherited ? 'created (workspace inherited from parent)' : 'created')
     if (input.lifecycle === 'long-running') {
       // 长期项目创建: straight into long-running execution; the spawner's
       // enterExecuting guard keeps this from spawning any agent session.
@@ -248,9 +295,14 @@ export class KanbanHostService {
     const project = this.requireProject(projectId)
     assertTransitionAllowed(project.status, 'executing', 'human')
     const leaves = this.loadDecompositionLeaves(project)
-    this.commit(project, 'human', project.status, 'executing', leaves.length > 0 ? 'plan confirmed (decomposed)' : 'plan confirmed')
-    if (leaves.length > 0) {
-      this.materializeTasks(project, leaves)
+    // Validate BEFORE committing (half-commit fix, repro d6b241b8): a broken
+    // decomposition (duplicate title path, dangling dependsOn, cycle) must
+    // throw here, leaving the project exactly where it was — otherwise the
+    // persisted executing status with zero leaves strands the board.
+    const pending = leaves.length > 0 ? this.planTaskNodes(project, leaves) : []
+    this.commit(project, 'human', project.status, 'executing', pending.length > 0 ? 'plan confirmed (decomposed)' : 'plan confirmed')
+    if (pending.length > 0) {
+      this.commitTaskNodes(pending)
     } else {
       this.onEnterExecuting(this.requireProject(projectId))
     }
@@ -318,6 +370,10 @@ export class KanbanHostService {
     const index = this.state.projects.findIndex(project => project.id === projectId)
     if (index < 0) throw new TransitionError(`unknown project ${projectId}`)
     const project = this.state.projects[index]!
+    // Session-leak fix: cancel the project's own session and every task
+    // leaf's session before removal (best-effort, fire-and-forget).
+    this.cancelAttached(project.sessionId)
+    for (const task of this.projectTasks(projectId)) this.cancelAttached(task.sessionId)
     // Deleting a long-running project dissolves affiliations, never children.
     for (const child of this.state.projects) {
       if (child.parentId === projectId) {
@@ -392,6 +448,46 @@ export class KanbanHostService {
     assertTransitionAllowed(task.status, 'blocked', actor)
     this.taskCommit(task, actor, task.status, 'blocked', note)
     return this.requireTask(taskId)
+  }
+
+  /**
+   * Human soft-stop of a task leaf: best-effort cancel of its attached
+   * session, then any non-blocked status → blocked with an audit-trail
+   * note. Safety: the spawner only settles/spawns leaves in
+   * designing/executing, so once the leaf is blocked neither the in-flight
+   * cancel RPC's async window nor the next poll tick can resurrect it.
+   */
+  terminateTask(projectId: string, taskId: string, note?: string): TaskNode {
+    const task = this.requireProjectTask(projectId, taskId)
+    assertTransitionAllowed(task.status, 'blocked', 'human')
+    this.cancelAttached(task.sessionId)
+    this.taskCommit(task, 'human', task.status, 'blocked', note ?? '人工终止')
+    return this.requireTask(taskId)
+  }
+
+  /**
+   * Human hard-remove of a task leaf (any status, done included — the human
+   * is always in charge): best-effort cancel of its session, drop the leaf
+   * from the ledger, strip its id from every sibling's dependencies (each
+   * affected sibling gets a metadata history entry, mirroring deleteProject's
+   * child-unaffiliation pattern), remove its artifact file, then re-derive
+   * the project's completion (deleting the last unfinished leaf may complete
+   * the project).
+   */
+  deleteTask(projectId: string, taskId: string): void {
+    const task = this.requireProjectTask(projectId, taskId)
+    this.cancelAttached(task.sessionId)
+    const index = this.state.tasks.findIndex(candidate => candidate.id === taskId)
+    this.state.tasks.splice(index, 1)
+    for (const sibling of this.projectTasks(projectId)) {
+      if (!sibling.dependencies.includes(taskId)) continue
+      sibling.dependencies = sibling.dependencies.filter(id => id !== taskId)
+      this.taskCommit(sibling, 'system', sibling.status, sibling.status, '依赖任务已删除，依赖解除')
+    }
+    // Hygiene: the leaf's artifact goes with it (force: a missing file is fine).
+    rmSync(task.artifactPath ?? taskArtifactPath(this.requireProject(projectId), taskId), { force: true })
+    this.mutate()
+    this.checkProjectCompletion(projectId)
   }
 
   /** Persist and broadcast after any mutation. */
@@ -477,9 +573,22 @@ export class KanbanHostService {
    * resolve against `existing` (the project's current leaves) plus the new
    * batch itself, and the merged graph must be acyclic; a duplicate title
    * path, a broken reference, or a cycle fails the whole materialization
-   * loudly (nothing is half-created). Returns the created leaves.
+   * loudly (nothing is half-created — planning is pure and throws before any
+   * state change). Returns the created leaves.
    */
   private materializeTasks(project: Project, leaves: TaskLeaf[], existing: TaskNode[] = []): TaskNode[] {
+    const pending = this.planTaskNodes(project, leaves, existing)
+    this.commitTaskNodes(pending)
+    return pending
+  }
+
+  /**
+   * Pure planning phase of materializeTasks: build the new leaf nodes in
+   * memory, resolve every dependency reference, and assert the merged graph
+   * is acyclic. Touches NO state — any DecompositionError thrown here leaves
+   * the ledger (and its caller's in-flight commit) untouched.
+   */
+  private planTaskNodes(project: Project, leaves: TaskLeaf[], existing: TaskNode[] = []): TaskNode[] {
     const now = Date.now()
     const byPath = new Map<string, TaskNode>()
     for (const task of existing) byPath.set(task.titlePath, task)
@@ -516,6 +625,11 @@ export class KanbanHostService {
     // The existing graph is acyclic by construction; new edges only ever
     // originate from the new batch, so checking the merged graph suffices.
     assertAcyclic([...existing, ...pending])
+    return pending
+  }
+
+  /** Commit phase of materializeTasks: persist pre-validated leaves and fire their phase hooks. */
+  private commitTaskNodes(pending: TaskNode[]): void {
     for (const task of pending) {
       this.state.tasks.push(task)
       this.taskCommit(task, 'system', 'backlog', task.status, 'materialized')
@@ -523,7 +637,6 @@ export class KanbanHostService {
       if (task.kind === 'research' || task.kind === 'design') this.onEnterTaskDesigning(created)
       if (task.kind === 'execute') this.onEnterTaskExecuting(created)
     }
-    return pending
   }
 
   /**

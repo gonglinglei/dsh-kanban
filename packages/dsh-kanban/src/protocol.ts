@@ -103,8 +103,22 @@ export interface TaskNode {
 /** Capability token: the host understands lifecycle: 'long-running' on create-project. */
 export const CAPABILITY_LONG_RUNNING_PROJECTS = 'long-running-projects'
 
+/**
+ * Capability token: an affiliated one-shot project (parentId set) may omit
+ * workspaceDir on create-project — the host inherits the parent's directory
+ * and ignores any caller-supplied value.
+ */
+export const CAPABILITY_PARENT_WORKSPACE_INHERITANCE = 'parent-workspace-inheritance'
+
+/** Capability token: the host understands the task-level terminate-task / delete-task actions. */
+export const CAPABILITY_TASK_TERMINATE_DELETE = 'task-terminate-delete'
+
 /** Protocol capabilities the current host build supports (assembled per snapshot, never persisted). */
-export const HOST_CAPABILITIES: readonly string[] = [CAPABILITY_LONG_RUNNING_PROJECTS]
+export const HOST_CAPABILITIES: readonly string[] = [
+  CAPABILITY_LONG_RUNNING_PROJECTS,
+  CAPABILITY_PARENT_WORKSPACE_INHERITANCE,
+  CAPABILITY_TASK_TERMINATE_DELETE,
+]
 
 /** Full board state served by /state and pushed over /events. */
 export interface KanbanSnapshot {
@@ -125,7 +139,13 @@ export type KanbanAction =
   | {
       kind: 'create-project'
       title: string
-      workspaceDir: string
+      /**
+       * Working directory the agents execute in. Optional only when parentId
+       * is set: an affiliated one-shot project inherits its parent's directory
+       * (see CAPABILITY_PARENT_WORKSPACE_INHERITANCE); the host ignores a
+       * caller-supplied value in that case.
+       */
+      workspaceDir?: string
       goal: string
       /** 'long-running' creates a long-running project; absent means one-shot. */
       lifecycle?: 'long-running'
@@ -138,6 +158,10 @@ export type KanbanAction =
   | { kind: 'delete-project'; projectId: string }
   | { kind: 'answer-clarification'; projectId: string; taskId: string; answer: string }
   | { kind: 'confirm-task'; projectId: string; taskId: string }
+  /** Human soft-stop: cancel the leaf's session and park the leaf in blocked (audit trail kept). */
+  | { kind: 'terminate-task'; projectId: string; taskId: string; note?: string }
+  /** Human hard-remove: cancel the session, drop the leaf, release dependencies, clean artifacts. */
+  | { kind: 'delete-task'; projectId: string; taskId: string }
 
 /** One POST /action body. */
 export interface KanbanActionEnvelope {
@@ -166,10 +190,15 @@ export function parseActionEnvelope(body: string): KanbanActionEnvelope | undefi
     case 'create-project': {
       const a = action as { title?: unknown; workspaceDir?: unknown; goal?: unknown; lifecycle?: unknown; parentId?: unknown }
       if (typeof a.title !== 'string' || a.title.trim() === '') return undefined
-      if (typeof a.workspaceDir !== 'string' || a.workspaceDir.trim() === '') return undefined
+      if (a.parentId !== undefined && (typeof a.parentId !== 'string' || a.parentId === '')) return undefined
+      // workspaceDir may be omitted only by an affiliated one-shot create:
+      // the host inherits the parent's directory. A standalone create with a
+      // missing/blank dir stays malformed (strictness towards old clients).
+      const hasParent = typeof a.parentId === 'string' && a.parentId !== ''
+      const workspaceDirMissing = typeof a.workspaceDir !== 'string' || a.workspaceDir.trim() === ''
+      if (workspaceDirMissing && !hasParent) return undefined
       if (typeof a.goal !== 'string' || a.goal.trim() === '') return undefined
       if (a.lifecycle !== undefined && a.lifecycle !== 'long-running') return undefined
-      if (a.parentId !== undefined && (typeof a.parentId !== 'string' || a.parentId === '')) return undefined
       const lifecycle = a.lifecycle as 'long-running' | undefined
       const parentId = a.parentId as string | undefined
       return {
@@ -177,7 +206,7 @@ export function parseActionEnvelope(body: string): KanbanActionEnvelope | undefi
         action: {
           kind,
           title: a.title,
-          workspaceDir: a.workspaceDir,
+          ...(workspaceDirMissing ? {} : { workspaceDir: a.workspaceDir as string }),
           goal: a.goal,
           ...(lifecycle === undefined ? {} : { lifecycle }),
           ...(parentId === undefined ? {} : { parentId }),
@@ -217,6 +246,19 @@ export function parseActionEnvelope(body: string): KanbanActionEnvelope | undefi
       return { requestId: envelope.requestId, action: { kind, projectId: a.projectId, taskId: a.taskId, answer: a.answer } }
     }
     case 'confirm-task': {
+      const a = action as { projectId?: unknown; taskId?: unknown }
+      if (typeof a.projectId !== 'string' || a.projectId === '') return undefined
+      if (typeof a.taskId !== 'string' || a.taskId === '') return undefined
+      return { requestId: envelope.requestId, action: { kind, projectId: a.projectId, taskId: a.taskId } }
+    }
+    case 'terminate-task': {
+      const a = action as { projectId?: unknown; taskId?: unknown; note?: unknown }
+      if (typeof a.projectId !== 'string' || a.projectId === '') return undefined
+      if (typeof a.taskId !== 'string' || a.taskId === '') return undefined
+      if (a.note !== undefined && typeof a.note !== 'string') return undefined
+      return { requestId: envelope.requestId, action: { kind, projectId: a.projectId, taskId: a.taskId, ...(a.note === undefined ? {} : { note: a.note as string }) } }
+    }
+    case 'delete-task': {
       const a = action as { projectId?: unknown; taskId?: unknown }
       if (typeof a.projectId !== 'string' || a.projectId === '') return undefined
       if (typeof a.taskId !== 'string' || a.taskId === '') return undefined
