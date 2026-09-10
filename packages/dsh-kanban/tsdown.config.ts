@@ -18,7 +18,13 @@ const PLATFORM_MODULES = [
   '@deepseek-ai/dsh-client-schema-form',
 ] as const
 
-const PLUGIN_ID = 'dsh-kanban'
+/**
+ * The client bundle's registration id MUST equal the package name: the GUI's
+ * client-module loader keys its module table by the resolved package name of
+ * each loader entry (`dsh-client-modules`), and serves the bundle at
+ * `/plugins/<package name>/client.js`.
+ */
+const PLUGIN_ID = '@gonglinglei/dsh-kanban'
 
 const node: UserConfig = {
   name: PLUGIN_ID,

@@ -5,10 +5,10 @@
   "type": "module",
   "description": "Project board for the DeepSeek Harness (DSH) Web GUI: manage projects through a design → human-confirm → execute relay.",
   "scripts": {
-    "build": "pnpm --filter dsh-kanban build",
-    "typecheck": "pnpm --filter dsh-kanban typecheck",
-    "test": "pnpm --filter dsh-kanban test",
-    "watch": "pnpm --filter dsh-kanban watch"
+    "build": "pnpm --filter @gonglinglei/dsh-kanban build",
+    "typecheck": "pnpm --filter @gonglinglei/dsh-kanban typecheck",
+    "test": "pnpm --filter @gonglinglei/dsh-kanban test",
+    "watch": "pnpm --filter @gonglinglei/dsh-kanban watch"
   },
   "license": "Apache-2.0",
   "devDependencies": {

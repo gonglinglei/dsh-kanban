@@ -28,7 +28,7 @@ dsh plugin --profile web add link:$(pwd)/packages/dsh-kanban   # 装进 web prof
 迭代 browser 半身可用 `pnpm watch`（tsdown --watch）；profile 里是 `link:`
 安装，重启 `dsh web` 后产物即生效。
 
-卸载：`dsh plugin --profile web remove dsh-kanban`，然后重启 `dsh web`。
+卸载：`dsh plugin --profile web remove @gonglinglei/dsh-kanban`，然后重启 `dsh web`。
 
 ## 当前状态
 

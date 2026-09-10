@@ -1,8 +1,22 @@
 {
-  "name": "dsh-kanban",
+  "name": "@gonglinglei/dsh-kanban",
   "version": "0.1.0",
   "description": "Project board for the DSH Web GUI: design → human confirm → execute relay; mounted without DSH source changes.",
   "type": "module",
+  "author": "gonglinglei <gonglinglei@gmail.com>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gonglinglei/dsh-kanban.git",
+    "directory": "packages/dsh-kanban"
+  },
+  "homepage": "https://github.com/gonglinglei/dsh-kanban#readme",
+  "bugs": {
+    "url": "https://github.com/gonglinglei/dsh-kanban/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
   "exports": {
@@ -34,7 +48,8 @@
     "bundle": "tsdown",
     "watch": "tsdown --watch",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepublishOnly": "pnpm build && pnpm test"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
@@ -67,6 +82,5 @@
     "lib/**/*.d.ts.map",
     "src",
     "cordis.patch.yml"
-  ],
-  "license": "Apache-2.0"
+  ]
 }

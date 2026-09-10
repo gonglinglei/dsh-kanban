@@ -6,7 +6,7 @@
 - **Host 半身**（`src/index.ts`，跑在 dsh host 进程）：项目账本、状态机、
   递归任务拆解与依赖调度、会话拉起与轮询结算（Session Controller）、stale 定时器、
   webserver 路由（`/kanban/*`）与 system-prompt 通告。
-- **Browser 半身**（`src/client/`，经 `/plugins/ui-kanban/client.js` 由 web GUI
+- **Browser 半身**（`src/client/`，经 `/plugins/@gonglinglei/dsh-kanban/client.js` 由 web GUI
   伺服）：侧边栏「看板」入口 + 中心列 DOM 挂载的看板视图（7 列状态、项目卡
   与任务叶卡、确认/驳回、clarify 问答、项目/任务详情视图）。外部插件不能声明
   slot，两个表面都用自愈式 DOM 注入（dsh-web-ui 已验证的模式）。
@@ -20,7 +20,7 @@ dsh plugin --profile web add link:$(pwd)
 
 重启 `dsh web` 后侧边栏出现「看板」入口；点击后中心列显示看板。
 
-卸载：`dsh plugin --profile web remove dsh-kanban`，重启 `dsh web`。
+卸载：`dsh plugin --profile web remove @gonglinglei/dsh-kanban`，重启 `dsh web`。
 
 ## 开发循环
 
