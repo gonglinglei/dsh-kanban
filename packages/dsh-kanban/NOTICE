@@ -1,0 +1,24 @@
+dsh-kanban
+Copyright 2026 gonglinglei <gonglinglei@gmail.com>
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software developed by third parties:
+
+1. dsh-web (formerly dsh-web-ui) — https://github.com/zhu1090093659/dsh-web
+   Copyright the dsh-web authors.
+   Licensed under the Apache License, Version 2.0.
+
+   Portions of the following source files are derived from that project's
+   shared host helpers and are used under the terms of the Apache License 2.0:
+
+     - packages/dsh-kanban/src/dsh-home.ts   (DSH_HOME resolution helper)
+     - packages/dsh-kanban/src/loopback.ts   (loopback authority detection helper)
+
+   No NOTICE file is published by the upstream project; this notice is
+   provided to satisfy the attribution requirement of Apache License 2.0,
+   Section 4.
+
+2. All third-party npm dependencies are used under their own licenses
+   (MIT, ISC, BSD-2-Clause, BSD-3-Clause, Apache-2.0, MIT-0 and Python-2.0);
+   none of them are copyleft. See pnpm-lock.yaml for the exact dependency set.
