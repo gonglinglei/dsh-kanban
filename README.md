@@ -54,5 +54,9 @@ dsh plugin --profile web add link:$(pwd)/packages/dsh-kanban   # 装进 web prof
 - [x] 关联长期项目的一次性项目免选工作目录：host 强制继承父项目目录
       （capability `parent-workspace-inheritance` 握手，老 host 自动退回
       预填可编辑行为）
+- [x] 离场后新增任务请求的可观测与人工物化：结算之后再写入的
+      `tasks-additions.json` 不再永久孤儿化——扫描相位只读探测并把请求装配进
+      快照，看板显示「⏳ 待处理的新增任务请求（N 项）」+「物化到看板」一键入口
+      （capability `late-task-additions` 握手），格式错误的请求同样在卡上可见
 
 详见 `packages/dsh-kanban/README.md`。

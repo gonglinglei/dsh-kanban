@@ -33,6 +33,82 @@ export interface HistoryEntry {
 /** Project lifecycle: the classic one-shot relay, or a long-running board container. */
 export type ProjectLifecycle = 'one-shot' | 'long-running'
 
+/**
+ * Which path wrote a node into `blocked` — the machine-readable counterpart
+ * of the human-readable `HistoryEntry.note`. Kept as an open, additive union:
+ * a new terminal path must add its cause here and emit a diagnostic.
+ */
+export type FailureCause =
+  /** poll settle: the session's turn/end gave a non-recoverable terminal verdict. */
+  | 'turn-end'
+  /** the session vanished from the session list (inspect returned cancelled). */
+  | 'session-missing'
+  /** create/rename/prompt RPC failed (SessionLaunchError). */
+  | 'launch'
+  /** a research/design turn ended but the required artifact file does not exist. */
+  | 'artifact-missing'
+  /** applyTaskAdditions threw (the agent's tasks-additions.json is malformed). */
+  | 'task-additions'
+  /** the stale timer fired (disabled by default: maxStaleMinutes = 0). */
+  | 'stale'
+  /** a human terminated the leaf. */
+  | 'human'
+  /** a recovery re-verdict came back failed. */
+  | 'recovery'
+
+/**
+ * The structured failure a blocked node carries, so a card can explain WHY
+ * without grepping the session log. Additive and optional: old ledgers and
+ * old clients simply do not have it.
+ */
+export interface FailureDiagnostic {
+  /** Epoch millis the diagnostic was written (not the turn/end's own time). */
+  at: number
+  cause: FailureCause
+  /** Human-readable summary (already scrubbed/bounded by the producer). */
+  message: string
+  /** The turn/end reason.kind, verbatim (when cause === 'turn-end' | 'recovery'). */
+  reason?: string
+  /** The abort cause when reason === 'aborted' (user/parent/hook/disposed/legacy). */
+  cancelCause?: string
+  /** The LlmFailure code (e.g. 'AUTH', 'QUOTA') when the turn/end was an error. */
+  code?: string
+  /** The LlmFailure status (e.g. 403) when the turn/end was an error. */
+  status?: number
+  /** The turn number the verdict was read from. */
+  turn?: number
+  /** The event seq the verdict was read from. */
+  seq?: number
+  /** The session the failure was observed in (audit trail). */
+  sessionId?: string
+  /**
+   * Advisory only: whether the failure looks recoverable. Used for the UI
+   * hint, NEVER to gate the recovery entry (a wrong score must never close
+   * the only door out of `blocked`).
+   */
+  recoverable: boolean
+}
+
+/** The two strategies a human recovery request can ask for. */
+export type RecoveryStrategy =
+  /** re-read the attached session's log and let the system re-decide (never prompts). */
+  | 'reinspect'
+  /** abandon the old session and let the leaf spawn/run fresh. */
+  | 'requeue'
+
+/**
+ * An in-flight human recovery request. Written by recoverTask, cleared by
+ * taskCommit as soon as the node leaves an active status — its presence both
+ * documents the intent (audit) and gates the host-restart resume hook (a
+ * recovered leaf must be re-judged, never blindly re-prompted).
+ */
+export interface RecoveryRequest {
+  at: number
+  strategy: RecoveryStrategy
+  /** The session under re-inspection (audit evidence); absent for requeue. */
+  sessionId?: string
+}
+
 /** One project card. */
 export interface Project {
   id: string
@@ -66,6 +142,8 @@ export interface Project {
   sessionRole?: 'design' | 'execute'
   /** Feedback from the latest human rejection. */
   feedback?: string
+  /** The last failure diagnostic (kept after a successful recovery as audit). */
+  lastFailure?: FailureDiagnostic
   /** Append-only transition log. */
   history: HistoryEntry[]
 }
@@ -92,6 +170,10 @@ export interface TaskNode {
   sessionRole?: 'research' | 'design' | 'execute'
   /** Ids of sibling leaves that must be done before this leaf spawns. */
   dependencies: string[]
+  /** The last failure diagnostic; rendered only while status === 'blocked'. */
+  lastFailure?: FailureDiagnostic
+  /** An in-flight human recovery request (see RecoveryRequest). */
+  recovery?: RecoveryRequest
   version: number
   createdAt: number
   updatedAt: number
@@ -113,12 +195,66 @@ export const CAPABILITY_PARENT_WORKSPACE_INHERITANCE = 'parent-workspace-inherit
 /** Capability token: the host understands the task-level terminate-task / delete-task actions. */
 export const CAPABILITY_TASK_TERMINATE_DELETE = 'task-terminate-delete'
 
+/**
+ * Capability token: the host understands the task-level recover-task action
+ * (re-judge a mis-blocked leaf from its session log, or requeue it). Appended
+ * last so pre-existing capability orderings never shift.
+ */
+export const CAPABILITY_TASK_RECOVERY = 'task-recovery'
+
+/**
+ * Capability token: the host understands the project-level
+ * `materialize-additions` action and emits the snapshot's `pendingAdditions`
+ * assembly field. Appended last so pre-existing capability orderings never
+ * shift (an old client's `includes()` checks are position-independent).
+ */
+export const CAPABILITY_LATE_TASK_ADDITIONS = 'late-task-additions'
+
 /** Protocol capabilities the current host build supports (assembled per snapshot, never persisted). */
 export const HOST_CAPABILITIES: readonly string[] = [
   CAPABILITY_LONG_RUNNING_PROJECTS,
   CAPABILITY_PARENT_WORKSPACE_INHERITANCE,
   CAPABILITY_TASK_TERMINATE_DELETE,
+  CAPABILITY_TASK_RECOVERY,
+  CAPABILITY_LATE_TASK_ADDITIONS,
 ]
+
+/** Upper bound on the per-request leaf preview carried by a snapshot (hot SSE data). */
+export const PENDING_ITEMS_MAX = 20
+
+/** One requested-but-not-yet-materialized task leaf of a pending additions request (bounded preview). */
+export interface PendingAdditionItem {
+  /** The leaf's title chain exactly as the agent wrote it (whitespace-collapsed + length-bounded). */
+  titlePath: string
+  kind: TaskKind
+}
+
+/**
+ * A task-additions request that exists on disk but has NOT been materialized.
+ * Assembled per snapshot from the spawner's probe cache — never persisted to
+ * the ledger (the same contract as `capabilities`).
+ *
+ * `state: 'malformed'` is a first-class outcome, not a failure to report: a
+ * node that already left the observation window (done / blocked) has no code
+ * path that would ever throw, so a parse failure must be visible HERE or it
+ * is invisible everywhere.
+ */
+export interface PendingAddition {
+  projectId: string
+  /** Request file basename only — the snapshot is a board view, not a filesystem map. */
+  file: string
+  /** mtime of the oldest aggregated request file (epoch millis): "pending since". */
+  at: number
+  state: 'ready' | 'malformed'
+  /** How many request files this entry aggregates (>= 1). */
+  batches: number
+  /** Total leaves every aggregated request will materialize (0 when malformed). */
+  count: number
+  /** Bounded preview, at most PENDING_ITEMS_MAX entries; absent when malformed. */
+  items?: PendingAdditionItem[]
+  /** Bounded parse/read failure message (<= 200 chars); present only when malformed. */
+  error?: string
+}
 
 /** Full board state served by /state and pushed over /events. */
 export interface KanbanSnapshot {
@@ -132,6 +268,13 @@ export interface KanbanSnapshot {
    * supports nothing beyond the one-shot relay.
    */
   capabilities?: string[]
+  /**
+   * Requests on disk awaiting materialization. Always present (possibly an
+   * empty array) on a host that declares CAPABILITY_LATE_TASK_ADDITIONS;
+   * absent on older hosts. A newer client renders the entry only when BOTH
+   * the capability and a non-empty entry are present.
+   */
+  pendingAdditions?: PendingAddition[]
 }
 
 /** Human-triggerable actions (the HTTP /action surface). */
@@ -162,6 +305,22 @@ export type KanbanAction =
   | { kind: 'terminate-task'; projectId: string; taskId: string; note?: string }
   /** Human hard-remove: cancel the session, drop the leaf, release dependencies, clean artifacts. */
   | { kind: 'delete-task'; projectId: string; taskId: string }
+  /**
+   * Human recovery of a blocked leaf: re-open it and let the spawner re-judge
+   * it from the session log ('reinspect', default when a session is attached)
+   * or requeue it as a fresh run ('requeue'). It never re-prompts an attached
+   * session and never writes a verdict itself — the poll's re-inspection does.
+   */
+  | { kind: 'recover-task'; projectId: string; taskId: string; strategy?: RecoveryStrategy; note?: string }
+  /**
+   * Human entry: materialize a project's pending task-additions request(s)
+   * NOW. The requests were written by an execution agent at any moment —
+   * including after its leaf was already settled — and the host only ever
+   * consumes them at settle time, so this action is the door for everything
+   * written afterwards. It re-opens a done/blocked project (human any→any
+   * edge) and the new execute leaves start running immediately.
+   */
+  | { kind: 'materialize-additions'; projectId: string; note?: string }
 
 /** One POST /action body. */
 export interface KanbanActionEnvelope {
@@ -263,6 +422,32 @@ export function parseActionEnvelope(body: string): KanbanActionEnvelope | undefi
       if (typeof a.projectId !== 'string' || a.projectId === '') return undefined
       if (typeof a.taskId !== 'string' || a.taskId === '') return undefined
       return { requestId: envelope.requestId, action: { kind, projectId: a.projectId, taskId: a.taskId } }
+    }
+    case 'recover-task': {
+      const a = action as { projectId?: unknown; taskId?: unknown; strategy?: unknown; note?: unknown }
+      if (typeof a.projectId !== 'string' || a.projectId === '') return undefined
+      if (typeof a.taskId !== 'string' || a.taskId === '') return undefined
+      if (a.strategy !== undefined && a.strategy !== 'reinspect' && a.strategy !== 'requeue') return undefined
+      if (a.note !== undefined && typeof a.note !== 'string') return undefined
+      return {
+        requestId: envelope.requestId,
+        action: {
+          kind,
+          projectId: a.projectId,
+          taskId: a.taskId,
+          ...(a.strategy === undefined ? {} : { strategy: a.strategy as RecoveryStrategy }),
+          ...(a.note === undefined ? {} : { note: a.note }),
+        },
+      }
+    }
+    case 'materialize-additions': {
+      const a = action as { projectId?: unknown; note?: unknown }
+      if (typeof a.projectId !== 'string' || a.projectId === '') return undefined
+      if (a.note !== undefined && typeof a.note !== 'string') return undefined
+      return {
+        requestId: envelope.requestId,
+        action: { kind, projectId: a.projectId, ...(a.note === undefined ? {} : { note: a.note }) },
+      }
     }
     default:
       return undefined

@@ -71,6 +71,18 @@ html[data-dsh-kanban-active] [class*='centerCol'] > :not([data-dsh-kanban-view])
 }
 [data-dsh-kanban-view] .dk-card-error { margin: 0; font-size: 12px; color: #b3261e; }
 [data-dsh-kanban-view] .dk-card-waiting { margin: 0; font-size: 12px; color: #b26a00; }
+[data-dsh-kanban-view] .dk-card-failure {
+  margin: 0; font-size: 12px; color: #b3261e; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+[data-dsh-kanban-view] .dk-card-recovering { margin: 0; font-size: 12px; color: #b26a00; }
+/* Pending task-additions request: an actionable positive hint, so it sits
+   before the failure chip and reuses the amber/red palette. */
+[data-dsh-kanban-view] .dk-card-pending { margin: 0; font-size: 12px; color: #b26a00; font-weight: 600; }
+[data-dsh-kanban-view] .dk-card-pending-error { margin: 0; font-size: 12px; color: #b3261e; font-weight: 600; }
+[data-dsh-kanban-view] .dk-pending-section { border-left: 3px solid #e0a63c; }
+[data-dsh-kanban-view] .dk-pending-item { margin: 0; font-size: 12px; word-break: break-all; }
+[data-dsh-kanban-view] .dk-pending-meta { margin: 0; font-size: 11px; color: var(--dsw-alias-text-tertiary, #999); }
+[data-dsh-kanban-view] .dk-hint { margin: 0; font-size: 12px; color: #6b6b6b; }
 [data-dsh-kanban-view] .dk-card-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 [data-dsh-kanban-view] .dk-btn {
   border: 1px solid var(--dsw-alias-border, #d0d0d0); background: var(--dsw-alias-bg-base, #fff);
@@ -124,6 +136,11 @@ html[data-dsh-kanban-active] [class*='centerCol'] > :not([data-dsh-kanban-view])
 }
 [data-dsh-kanban-view] .dk-detail-grid dt { color: var(--dsw-alias-text-tertiary, #999); }
 [data-dsh-kanban-view] .dk-detail-grid dd { margin: 0; word-break: break-all; }
+[data-dsh-kanban-view] .dk-failure-grid {
+  margin: 0; display: grid; grid-template-columns: 88px 1fr; gap: 6px 12px; font-size: 12px;
+}
+[data-dsh-kanban-view] .dk-failure-grid dt { color: var(--dsw-alias-text-tertiary, #999); }
+[data-dsh-kanban-view] .dk-failure-grid dd { margin: 0; word-break: break-all; }
 [data-dsh-kanban-view] .dk-detail-task {
   background: var(--dsw-alias-bg-base, #fff); border: 1px solid var(--dsw-alias-border, #e0e0e0);
   border-radius: 6px; padding: 8px 10px; display: flex; flex-direction: column; gap: 4px;

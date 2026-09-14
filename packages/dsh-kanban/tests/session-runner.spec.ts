@@ -53,7 +53,9 @@ function turnEnd(time: number, error = false): KanbanHistoryEvent {
       type: 'turn/end',
       seq: 1,
       time,
-      data: error ? { reason: { kind: 'error', message: 'boom' } } : {},
+      // Real payload shape: the LlmFailure lives at reason.error (see
+      // TurnEndReasonMap in @deepseek-ai/dsh-session).
+      data: error ? { turn: 1, reason: { kind: 'error', error: { message: 'boom', code: 'X' } } } : {},
     },
   }
 }
@@ -74,7 +76,7 @@ describe('KanbanSessionRunner', () => {
     expect(existsSync(projectDir(project))).toBe(true)
   })
 
-  it('launchDesign clears only this project\'s stale artifacts, never a parallel project\'s', async () => {
+  it('launchDesign clears only this project\'s stale PLAN, never a parallel project\'s artifacts', async () => {
     const api = new FakeApi()
     const runner = new KanbanSessionRunner(api)
     const projectA = sampleProject({ id: 'pa' })
@@ -84,6 +86,9 @@ describe('KanbanSessionRunner', () => {
     writeFileSync(planPathFor(projectA), '旧方案', 'utf8')
     writeFileSync(decompositionPathFor(projectA), '{"tasks":[]}', 'utf8')
     writeFileSync(join(projectDir(projectA), 'artifacts', 'old.md'), 'x', 'utf8')
+    // A pending request from A's previous round: it is NOT a stale plan, so a
+    // fresh design round must keep it (silently deleting it was a data loss).
+    writeFileSync(join(projectDir(projectA), 'tasks-additions.json'), '{"decomposed":true,"tasks":[]}', 'utf8')
     // Project B shares the same workspaceDir and is mid-flight: its plan,
     // decomposition and task artifacts must survive A's fresh design round.
     mkdirSync(join(projectDir(projectB), 'artifacts'), { recursive: true })
@@ -96,7 +101,10 @@ describe('KanbanSessionRunner', () => {
     await runner.launchDesign(projectA)
     expect(existsSync(projectDir(projectA))).toBe(true) // re-created by launch
     expect(existsSync(planPathFor(projectA))).toBe(false)
-    expect(existsSync(join(projectDir(projectA), 'artifacts', 'old.md'))).toBe(false)
+    expect(existsSync(decompositionPathFor(projectA))).toBe(false)
+    // Selective clean-up: A's task artifacts and pending request survive.
+    expect(readFileSync(join(projectDir(projectA), 'artifacts', 'old.md'), 'utf8')).toBe('x')
+    expect(existsSync(join(projectDir(projectA), 'tasks-additions.json'))).toBe(true)
     expect(readFileSync(planPathFor(projectB), 'utf8')).toBe('B 的方案')
     expect(readFileSync(decompositionPathFor(projectB), 'utf8')).toBe('{"decomposed":true,"tasks":[]}')
     expect(readFileSync(join(projectDir(projectB), 'artifacts', 'b.md'), 'utf8')).toBe('B 的产物')
@@ -139,7 +147,51 @@ describe('KanbanSessionRunner', () => {
     const runner = new KanbanSessionRunner(api)
     expect(await runner.inspect('ghost', 0)).toEqual({ outcome: 'cancelled', error: 'execution session no longer exists' })
     api.sessions.summaries.set('sess-1', { sessionId: 'sess-1', running: true })
-    expect(await runner.inspect('sess-1', 0)).toEqual({ outcome: 'pending' })
+    expect(await runner.inspect('sess-1', 0)).toEqual({ outcome: 'pending', pending: 'running' })
+  })
+
+  it('inspects: the incident timeline — AUTH error turn 1 then completed turn 2 is a SUCCESS (A1)', async () => {
+    // Verbatim shape of session-7bcb72ad (the production incident): seq 201
+    // turn 1 died on the 5-hour quota error (403 / AUTH), a human typed「继续」
+    // and seq 436 turn 2 finished the work. The pre-recovery build returned the
+    // FIRST turn/end, so this exact log read as `failed` — forever.
+    const api = new FakeApi()
+    api.sessions.summaries.set('sess-incident', { sessionId: 'sess-incident', running: false })
+    api.sessions.histories.set('sess-incident', [
+      { event: { type: 'turn/end', seq: 201, time: 1_789_026_484_965, data: { turn: 1, reason: { kind: 'error', error: { message: "You've reached your 5-hour usage limit", code: 'AUTH', status: 403 } } } } },
+      { event: { type: 'agent/inbox/spliced', seq: 204, time: 1_789_027_343_042, data: {} } },
+      { event: { type: 'turn/end', seq: 436, time: 1_789_028_252_372, data: { turn: 2, reason: { kind: 'completed' } } } },
+    ])
+    const runner = new KanbanSessionRunner(api)
+
+    // startedAt = the execute prompt injection (1789024787076) < turn 1:
+    // both turns are inside the window, so the LAST one decides.
+    const outcome = await runner.inspect('sess-incident', 1_789_024_787_076)
+    expect(outcome.outcome).toBe('succeeded')
+    if (outcome.outcome !== 'succeeded') throw new Error('unreachable')
+    expect(outcome.turn.kind).toBe('completed')
+    expect(outcome.turn.seq).toBe(436)
+    expect(outcome.turn.turn).toBe(2)
+
+    // And the error alone (before the human continued) is observation, not a verdict.
+    api.sessions.histories.set('sess-incident', [
+      { event: { type: 'turn/end', seq: 201, time: 1_789_026_484_965, data: { turn: 1, reason: { kind: 'error', error: { message: "You've reached your 5-hour usage limit", code: 'AUTH', status: 403 } } } } },
+    ])
+    expect((await runner.inspect('sess-incident', 1_789_024_787_076)).outcome).toBe('observing')
+  })
+
+  it('inspects: a stale tick list never declares a live session dead (re-list self-verification)', async () => {
+    // The tick's session list was fetched before this leaf created its own
+    // session, so it misses it. Trusting that snapshot would report
+    // 'cancelled' and permanently park a freshly launched leaf.
+    const api = new FakeApi()
+    api.sessions.summaries.set('sess-new', { sessionId: 'sess-new', running: true })
+    const runner = new KanbanSessionRunner(api)
+    expect(await runner.inspect('sess-new', 0, [])).toEqual({ outcome: 'pending', pending: 'running' })
+
+    // A miss that is confirmed by a fresh list is a genuinely vanished session.
+    api.sessions.summaries.delete('sess-new')
+    expect(await runner.inspect('sess-new', 0, [])).toEqual({ outcome: 'cancelled', error: 'execution session no longer exists' })
   })
 
   it('inspects: a turn/end after launch is success, before launch is ignored', async () => {
@@ -147,16 +199,48 @@ describe('KanbanSessionRunner', () => {
     api.sessions.summaries.set('sess-1', { sessionId: 'sess-1', running: false })
     api.sessions.histories.set('sess-1', [turnEnd(50), turnEnd(150)])
     const runner = new KanbanSessionRunner(api)
-    expect(await runner.inspect('sess-1', 100)).toEqual({ outcome: 'succeeded' })
-    expect(await runner.inspect('sess-1', 200)).toEqual({ outcome: 'pending' })
+    const settled = await runner.inspect('sess-1', 100)
+    expect(settled.outcome).toBe('succeeded')
+    if (settled.outcome !== 'succeeded') throw new Error('unreachable')
+    expect(settled.turn.kind).toBe('completed')
+    expect(settled.turn.time).toBe(150)
+    // Nothing in the window: not running, no judgeable turn/end.
+    expect(await runner.inspect('sess-1', 200)).toEqual({ outcome: 'pending', pending: 'no-evidence' })
   })
 
-  it('inspects: an error turn/end is a failure', async () => {
+  it('inspects: an error turn/end is observed, not terminal (policy A)', async () => {
     const api = new FakeApi()
     api.sessions.summaries.set('sess-1', { sessionId: 'sess-1', running: false })
     api.sessions.histories.set('sess-1', [turnEnd(50, true)])
     const runner = new KanbanSessionRunner(api)
-    expect(await runner.inspect('sess-1', 0)).toEqual({ outcome: 'failed', error: 'agent turn ended with an error' })
+    const outcome = await runner.inspect('sess-1', 0)
+    expect(outcome.outcome).toBe('observing')
+    if (outcome.outcome !== 'observing') throw new Error('unreachable')
+    expect(outcome.turn.kind).toBe('error')
+    expect(outcome.turn.failure).toEqual({ message: 'boom', code: 'X' })
+    // The real failure facts ride the note (A6): no more fixed string.
+    expect(outcome.note).toContain('boom')
+    expect(outcome.note).toContain('X')
+    expect(outcome.note).not.toContain('agent turn ended with an error')
+  })
+
+  it('inspects: a session-stuck error code stops the leaf instead of waiting', async () => {
+    const api = new FakeApi()
+    api.sessions.summaries.set('sess-1', { sessionId: 'sess-1', running: false })
+    api.sessions.histories.set('sess-1', [{
+      event: {
+        type: 'turn/end',
+        seq: 7,
+        time: 50,
+        data: { turn: 1, reason: { kind: 'error', error: { message: 'context too long', code: 'CONTEXT_WINDOW_EXCEEDED' } } },
+      },
+    }])
+    const runner = new KanbanSessionRunner(api)
+    const outcome = await runner.inspect('sess-1', 0)
+    expect(outcome.outcome).toBe('stopped')
+    if (outcome.outcome !== 'stopped') throw new Error('unreachable')
+    expect(outcome.note).toContain('CONTEXT_WINDOW_EXCEEDED')
+    expect(outcome.note).toContain('cannot progress')
   })
 
   it('planExists reflects the on-disk artifact', () => {

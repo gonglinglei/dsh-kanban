@@ -10,8 +10,11 @@
  */
 import { useEffect, useSyncExternalStore, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { Project, ProjectStatus, TaskNode } from '../protocol.ts'
-import { CAPABILITY_LONG_RUNNING_PROJECTS, CAPABILITY_PARENT_WORKSPACE_INHERITANCE, CAPABILITY_TASK_TERMINATE_DELETE } from '../protocol.ts'
+import type { FailureDiagnostic, PendingAddition, Project, ProjectStatus, TaskNode } from '../protocol.ts'
+import {
+  CAPABILITY_LATE_TASK_ADDITIONS, CAPABILITY_LONG_RUNNING_PROJECTS, CAPABILITY_PARENT_WORKSPACE_INHERITANCE,
+  CAPABILITY_TASK_RECOVERY, CAPABILITY_TASK_TERMINATE_DELETE,
+} from '../protocol.ts'
 import { DependencyGraph } from './dep-graph.tsx'
 import { ACTOR_LABELS, KIND_LABELS, STATUS_LABELS } from './labels.ts'
 import { rememberWorkspaceDir } from './last-workspace-dir.ts'
@@ -34,6 +37,55 @@ const COLUMNS: ReadonlyArray<{ status: ProjectStatus; label: string }> = [
 /** Epoch millis → locale string (detail view timestamps). */
 function formatTime(at: number): string {
   return new Date(at).toLocaleString()
+}
+
+/**
+ * One-line failure summary for the card chip: the coded reason first, then the
+ * turn/seq bracket when the diagnostic carries them. Built from parts so a
+ * diagnostic that only has a message never renders stray separators (old
+ * ledgers and non-turn/end causes legitimately omit code/status/turn/seq).
+ */
+function failureChipText(failure: FailureDiagnostic): string {
+  const parts: string[] = []
+  if (failure.code !== undefined) parts.push(`${failure.code}${failure.status !== undefined ? ` (HTTP ${failure.status})` : ''}`)
+  parts.push(failure.message)
+  if (failure.turn !== undefined || failure.seq !== undefined) {
+    const bracket = [failure.turn !== undefined ? `turn ${failure.turn}` : undefined, failure.seq !== undefined ? `seq ${failure.seq}` : undefined]
+      .filter((part): part is string => part !== undefined)
+      .join(', ')
+    parts.push(`[${bracket}]`)
+  }
+  return `⚠ ${parts.join(' · ')}`
+}
+
+/**
+ * The card badge of a pending task-additions request. A malformed body is a
+ * first-class state, not an absent one: when the leaf that wrote it was already
+ * settled, the snapshot is the ONLY place that failure can surface.
+ */
+function pendingBadge(pending: PendingAddition): { text: string; title: string; malformed: boolean } {
+  if (pending.state === 'malformed') {
+    return { text: '⚠ 待处理的新增任务请求无法解析', title: pending.error ?? '请求文件格式错误', malformed: true }
+  }
+  return {
+    text: `⏳ 待处理的新增任务请求（${pending.count} 项）${pending.batches > 1 ? `（${pending.batches} 个批次）` : ''}`,
+    title: `来源 ${pending.file} · 写入于 ${formatTime(pending.at)}`,
+    malformed: false,
+  }
+}
+
+/**
+ * The double-confirm text for materializing: it really does start one session
+ * per execute leaf, really spends quota, and really re-opens a completed
+ * project.
+ */
+function materializeConfirmText(project: Project, pending: PendingAddition): string {
+  const executeCount = pending.items?.filter(item => item.kind === 'execute').length ?? 0
+  const extra = executeCount > 0 ? `，并立即为其中 ${executeCount} 个执行叶子拉起会话（真实消耗额度、真实改动仓库）` : ''
+  const reopen = project.status === 'done' || project.status === 'blocked'
+    ? `（项目将从「${STATUS_LABELS[project.status]}」重新进入执行中）`
+    : ''
+  return `物化「${project.title}」的 ${pending.count} 项新增任务到看板${extra}${reopen}？`
 }
 
 export interface BoardProps {
@@ -67,8 +119,7 @@ function useOpenSession(onOpenSession: (sessionId: string) => void): { openError
   return { openError, open }
 }
 
-/** Titles of a task's not-yet-done dependencies (card waiting line and detail dependencies section). */
-function waitingForTitles(task: TaskNode, tasks: TaskNode[]): string[] {
+/** Titles of a task's not-yet-done dependencies (card waiting line and detail dependencies section). */function waitingForTitles(task: TaskNode, tasks: TaskNode[]): string[] {
   return task.dependencies
     .map(id => tasks.find(candidate => candidate.id === id))
     .filter((candidate): candidate is TaskNode => candidate !== undefined && candidate.status !== 'done')
@@ -103,6 +154,19 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
   // Same handshake pattern for task-level terminate/delete: only a host
   // declaring the capability gets the buttons (an old host would 400 them).
   const supportsTaskTerminateDelete = snapshot.capabilities?.includes(CAPABILITY_TASK_TERMINATE_DELETE) ?? false
+  // Same handshake pattern for task-level human recovery: the failure chip and
+  // the「最近失败」section are read-side fields (rendered whenever present), but
+  // the recover-task buttons need the host to understand the action.
+  const supportsTaskRecovery = snapshot.capabilities?.includes(CAPABILITY_TASK_RECOVERY) ?? false
+  // Same handshake pattern for late task-additions requests: the badge and the
+  // 「物化到看板」entry need the host to understand `materialize-additions`
+  // (an old host would 400 it), so they are gated on BOTH the capability and a
+  // non-empty assembly field.
+  const supportsLateAdditions = snapshot.capabilities?.includes(CAPABILITY_LATE_TASK_ADDITIONS) ?? false
+  const pendingByProject = new Map<string, PendingAddition>()
+  if (supportsLateAdditions) {
+    for (const entry of snapshot.pendingAdditions ?? []) pendingByProject.set(entry.projectId, entry)
+  }
 
   if (detailTask !== undefined) {
     return (
@@ -114,6 +178,7 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
           store={store}
           backLabel={detailId === null ? '返回看板' : '返回项目'}
           supportsTaskTerminateDelete={supportsTaskTerminateDelete}
+          supportsTaskRecovery={supportsTaskRecovery}
           onBack={() => { setDetailTaskId(null) }}
           onAction={action => { void store.apply(action) }}
           onOpenSession={openSession}
@@ -154,6 +219,7 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
                       project={project}
                       parentTitle={project.parentId === undefined ? undefined : snapshot.projects.find(parent => parent.id === project.parentId)?.title}
                       taskCount={snapshot.tasks.filter(task => task.projectId === project.id).length}
+                      pending={pendingByProject.get(project.id)}
                       rejecting={rejectingId === project.id}
                       onToggleReject={() => { setRejectingId(rejectingId === project.id ? null : project.id) }}
                       onAction={action => { void store.apply(action) }}
@@ -168,6 +234,7 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
                       projectTitle={snapshot.projects.find(project => project.id === task.projectId)?.title ?? ''}
                       waitingFor={waitingForTitles(task, snapshot.tasks)}
                       supportsTaskTerminateDelete={supportsTaskTerminateDelete}
+                      supportsTaskRecovery={supportsTaskRecovery}
                       onAction={action => { void store.apply(action) }}
                       onOpenSession={openSession}
                       onOpenDetail={() => { setDetailTaskId(task.id) }}
@@ -184,6 +251,8 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
           tasks={snapshot.tasks.filter(task => task.projectId === detailProject.id)}
           parentTitle={detailProject.parentId === undefined ? undefined : snapshot.projects.find(parent => parent.id === detailProject.parentId)?.title}
           childProjects={snapshot.projects.filter(candidate => candidate.parentId === detailProject.id)}
+          pending={pendingByProject.get(detailProject.id)}
+          supportsLateAdditions={supportsLateAdditions}
           store={store}
           onBack={() => { setDetailId(null) }}
           onOpenProjectDetail={projectId => { setDetailId(projectId) }}
@@ -229,6 +298,12 @@ interface ProjectCardProps {
   /** Resolved title of the parent long-running project (undefined when unaffiliated or the parent is gone). */
   parentTitle?: string
   taskCount: number
+  /**
+   * A request on disk that has not been materialized yet (only supplied when
+   * the host declares the capability). Optional so existing fixtures are
+   * untouched and an old host simply renders nothing.
+   */
+  pending?: PendingAddition
   rejecting: boolean
   onToggleReject(): void
   onAction(action: Parameters<BoardStore['apply']>[0]): void
@@ -236,12 +311,18 @@ interface ProjectCardProps {
   onOpenDetail(): void
 }
 
-function ProjectCard({ project, parentTitle, taskCount, rejecting, onToggleReject, onAction, onOpenSession, onOpenDetail }: ProjectCardProps): JSX.Element {
+function ProjectCard({ project, parentTitle, taskCount, pending, rejecting, onToggleReject, onAction, onOpenSession, onOpenDetail }: ProjectCardProps): JSX.Element {
   const { openError, open } = useOpenSession(onOpenSession)
   const handleOpenSession = (): void => { open(project.sessionId!) }
   const sessionChip = project.sessionId !== undefined
     ? <button className="dk-btn dk-btn-ghost" onClick={handleOpenSession}>打开会话</button>
     : null
+  const badge = pending === undefined ? undefined : pendingBadge(pending)
+  const handleMaterialize = (): void => {
+    if (pending === undefined) return
+    if (!globalThis.confirm(materializeConfirmText(project, pending))) return
+    onAction({ kind: 'materialize-additions', projectId: project.id })
+  }
 
   return (
     <article className="dk-card">
@@ -258,6 +339,15 @@ function ProjectCard({ project, parentTitle, taskCount, rejecting, onToggleRejec
         {taskCount > 0 && <> · 子任务 {taskCount}</>}
         {project.feedback !== undefined && <> · 反馈：{project.feedback}</>}
       </div>
+      {badge !== undefined && (
+        <p
+          className={badge.malformed ? 'dk-card-pending-error' : 'dk-card-pending'}
+          title={badge.title}
+        >{badge.text}</p>
+      )}
+      {project.status === 'blocked' && project.lastFailure !== undefined && (
+        <p className="dk-card-failure" title={failureChipText(project.lastFailure)}>{failureChipText(project.lastFailure)}</p>
+      )}
       {openError !== null && <p className="dk-card-error">无法打开会话：{openError}</p>}
       <div className="dk-card-actions">
         {project.status === 'awaiting-review' && (
@@ -270,6 +360,10 @@ function ProjectCard({ project, parentTitle, taskCount, rejecting, onToggleRejec
           <button className="dk-btn" onClick={() => { onAction({ kind: 'transition', projectId: project.id, to: 'designing', note: 're-design from blocked' }) }}>重新设计</button>
         )}
         {(project.status === 'designing' || project.status === 'executing' || project.status === 'done') && sessionChip}
+        {pending !== undefined && (badge!.malformed
+          ? <button className="dk-btn" disabled title="修复请求文件后再试；格式错误的请求不会被物化">无法物化（请求格式错误）</button>
+          : <button className="dk-btn dk-btn-primary" onClick={handleMaterialize}>物化到看板</button>
+        )}
         <button className="dk-btn dk-btn-ghost" onClick={onOpenDetail}>详情</button>
         <button
           className="dk-btn dk-btn-ghost"
@@ -293,13 +387,15 @@ interface TaskCardProps {
   waitingFor: string[]
   /** Host capability handshake: old hosts 400 terminate/delete, so hide the buttons. */
   supportsTaskTerminateDelete: boolean
+  /** Host capability handshake: old hosts 400 recover-task, so hide the buttons. */
+  supportsTaskRecovery: boolean
   onAction(action: Parameters<BoardStore['apply']>[0]): void
   onOpenSession(sessionId: string): void
   onOpenDetail(): void
 }
 
 /** One decomposed task leaf: level-indented title, kind badge, and kind-specific actions. */
-function TaskCard({ task, projectTitle, waitingFor, supportsTaskTerminateDelete, onAction, onOpenSession, onOpenDetail }: TaskCardProps): JSX.Element {
+function TaskCard({ task, projectTitle, waitingFor, supportsTaskTerminateDelete, supportsTaskRecovery, onAction, onOpenSession, onOpenDetail }: TaskCardProps): JSX.Element {
   const segments = task.titlePath.split(' > ')
   const level = segments.length - 1
   const [answerDraft, setAnswerDraft] = useState('')
@@ -316,6 +412,12 @@ function TaskCard({ task, projectTitle, waitingFor, supportsTaskTerminateDelete,
         {task.sessionId !== undefined && <> · {task.sessionId.slice(0, 13)}</>}
       </div>
       {waitingFor.length > 0 && <p className="dk-card-waiting">⏳ 等待依赖完成：{waitingFor.join('、')}</p>}
+      {task.status === 'blocked' && task.lastFailure !== undefined && (
+        <p className="dk-card-failure" title={failureChipText(task.lastFailure)}>{failureChipText(task.lastFailure)}</p>
+      )}
+      {task.recovery !== undefined && (
+        <p className="dk-card-recovering">⏳ 恢复判定中（{task.recovery.strategy}，{formatTime(task.recovery.at)}）</p>
+      )}
       {task.kind === 'clarify' && task.status === 'awaiting-clarification' && task.question !== undefined && (
         <div className="dk-reject">
           <p className="dk-card-goal">❓ {task.question}</p>
@@ -348,7 +450,23 @@ function TaskCard({ task, projectTitle, waitingFor, supportsTaskTerminateDelete,
         </div>
       )}
       <div className="dk-card-actions">
-        {task.sessionId !== undefined && (task.status === 'designing' || task.status === 'executing' || task.status === 'done') && (
+        {supportsTaskRecovery && task.status === 'blocked' && task.recovery === undefined && (
+          task.sessionId !== undefined ? (
+            <button
+              className="dk-btn"
+              onClick={() => { onAction({ kind: 'recover-task', projectId: task.projectId, taskId: task.id, strategy: 'reinspect' }) }}
+            >恢复</button>
+          ) : (
+            <button
+              className="dk-btn"
+              onClick={() => {
+                if (!globalThis.confirm('重新排队会新建会话重新执行该任务，确定？')) return
+                onAction({ kind: 'recover-task', projectId: task.projectId, taskId: task.id, strategy: 'requeue' })
+              }}
+            >重新排队</button>
+          )
+        )}
+        {task.sessionId !== undefined && (task.status === 'designing' || task.status === 'executing' || task.status === 'done' || task.status === 'blocked') && (
           <button className="dk-btn dk-btn-ghost" onClick={handleOpenSession}>打开会话</button>
         )}
         <button className="dk-btn dk-btn-ghost" onClick={onOpenDetail}>详情</button>
@@ -377,6 +495,10 @@ interface ProjectDetailProps {
   parentTitle?: string
   /** Projects affiliated to this one (only meaningful for a long-running project). */
   childProjects: Project[]
+  /** A request on disk that has not been materialized yet (capability-gated by the board). */
+  pending?: PendingAddition
+  /** Host capability handshake: old hosts 400 `materialize-additions`. */
+  supportsLateAdditions: boolean
   store: BoardStore
   onBack(): void
   onAction(action: Parameters<BoardStore['apply']>[0]): void
@@ -393,9 +515,12 @@ interface ProjectDetailProps {
  * plan preview (fetched on demand through the /kanban/file route), task
  * leaves, transition history, and the same action set as the card.
  */
-function ProjectDetail({ project, tasks, parentTitle, childProjects, store, onBack, onAction, onOpenSession, onOpenProjectDetail, onOpenTaskDetail }: ProjectDetailProps): JSX.Element {
+function ProjectDetail({ project, tasks, parentTitle, childProjects, pending, supportsLateAdditions, store, onBack, onAction, onOpenSession, onOpenProjectDetail, onOpenTaskDetail }: ProjectDetailProps): JSX.Element {
   const [rejecting, setRejecting] = useState(false)
   const { openError, open } = useOpenSession(onOpenSession)
+  // Capability-gated twice on purpose: an old host would 400 the action, so
+  // the entry never renders even if the assembly field were somehow present.
+  const pendingRequest = supportsLateAdditions ? pending : undefined
   const [plan, setPlan] = useState<{ state: 'loading' | 'loaded' | 'error'; text?: string; error?: string } | null>(null)
   const planPath = project.planPath
   // 子任务 section view switch. The lazy initializer only runs on mount, so
@@ -456,6 +581,54 @@ function ProjectDetail({ project, tasks, parentTitle, childProjects, store, onBa
           {openError !== null && <p className="dk-card-error">无法打开会话：{openError}</p>}
           {project.feedback !== undefined && <p className="dk-card-goal">最近反馈:{project.feedback}</p>}
         </section>
+
+        {project.status === 'blocked' && project.lastFailure !== undefined && (
+          <section className="dk-detail-section">
+            <h3 className="dk-detail-heading">最近失败</h3>
+            <p className="dk-card-failure" title={failureChipText(project.lastFailure)}>{failureChipText(project.lastFailure)}</p>
+            <p className="dk-hint">归类 {project.lastFailure.cause} · 依据时间 {formatTime(project.lastFailure.at)}</p>
+          </section>
+        )}
+
+        {pendingRequest !== undefined && (
+          <section className="dk-detail-section dk-pending-section">
+            <h3 className="dk-detail-heading">待处理的新增任务请求</h3>
+            {pendingRequest.state === 'malformed' ? (
+              <>
+                <p className="dk-card-pending-error">⚠ 无法解析：{pendingRequest.error ?? '未知错误'}</p>
+                <p className="dk-hint">文件保留在项目目录中；修复后下一个轮询周期会自动重新检测</p>
+              </>
+            ) : (
+              <>
+                <p className="dk-pending-meta">
+                  来源 {pendingRequest.file} · 写入于 {formatTime(pendingRequest.at)} · 共 {pendingRequest.count} 项
+                  {pendingRequest.batches > 1 ? `（${pendingRequest.batches} 个批次）` : ''}
+                </p>
+                {(pendingRequest.items ?? []).map((item, index) => (
+                  <p className="dk-pending-item" key={index}>
+                    <span className="dk-kind-badge">{KIND_LABELS[item.kind]}</span> {item.titlePath}
+                  </p>
+                ))}
+                {pendingRequest.count > (pendingRequest.items?.length ?? 0) && (
+                  <p className="dk-hint">…另有 {pendingRequest.count - (pendingRequest.items?.length ?? 0)} 项未展开</p>
+                )}
+              </>
+            )}
+            <div className="dk-card-actions">
+              {pendingRequest.state === 'malformed'
+                ? <button className="dk-btn" disabled>无法物化（请求格式错误）</button>
+                : (
+                  <button
+                    className="dk-btn dk-btn-primary"
+                    onClick={() => {
+                      if (!globalThis.confirm(materializeConfirmText(project, pendingRequest))) return
+                      onAction({ kind: 'materialize-additions', projectId: project.id })
+                    }}
+                  >物化到看板</button>
+                )}
+            </div>
+          </section>
+        )}
 
         <section className="dk-detail-section">
           <h3 className="dk-detail-heading">方案预览</h3>
@@ -579,6 +752,8 @@ interface TaskDetailProps {
   backLabel: string
   /** Host capability handshake: old hosts 400 terminate/delete, so hide the buttons. */
   supportsTaskTerminateDelete: boolean
+  /** Host capability handshake: old hosts 400 recover-task, so hide the buttons. */
+  supportsTaskRecovery: boolean
   onBack(): void
   onAction(action: Parameters<BoardStore['apply']>[0]): void
   onOpenSession(sessionId: string): void
@@ -593,7 +768,7 @@ interface TaskDetailProps {
  * the task-level transition history, and the same status-specific actions
  * as the card.
  */
-function TaskDetail({ task, projectTitle, waitingFor, store, backLabel, supportsTaskTerminateDelete, onBack, onAction, onOpenSession }: TaskDetailProps): JSX.Element {
+function TaskDetail({ task, projectTitle, waitingFor, store, backLabel, supportsTaskTerminateDelete, supportsTaskRecovery, onBack, onAction, onOpenSession }: TaskDetailProps): JSX.Element {
   const [answerDraft, setAnswerDraft] = useState('')
   const { openError, open } = useOpenSession(onOpenSession)
   const [artifact, setArtifact] = useState<{ state: 'loading' | 'loaded' | 'error'; text?: string; error?: string } | null>(null)
@@ -643,6 +818,28 @@ function TaskDetail({ task, projectTitle, waitingFor, store, backLabel, supports
           </dl>
           {openError !== null && <p className="dk-card-error">无法打开会话：{openError}</p>}
         </section>
+
+        {task.status === 'blocked' && task.lastFailure !== undefined && (
+          <section className="dk-detail-section">
+            <h3 className="dk-detail-heading">最近失败</h3>
+            <dl className="dk-failure-grid">
+              <dt>归类</dt><dd>{task.lastFailure.cause}</dd>
+              {task.lastFailure.reason !== undefined && (<><dt>结束原因</dt><dd>{task.lastFailure.reason}</dd></>)}
+              {task.lastFailure.code !== undefined && (<><dt>错误码</dt><dd>{task.lastFailure.code}</dd></>)}
+              {task.lastFailure.status !== undefined && (<><dt>HTTP</dt><dd>{task.lastFailure.status}</dd></>)}
+              <dt>消息</dt><dd>{task.lastFailure.message}</dd>
+              {task.lastFailure.turn !== undefined && (<><dt>turn</dt><dd>{task.lastFailure.turn}</dd></>)}
+              {task.lastFailure.seq !== undefined && (<><dt>seq</dt><dd>{task.lastFailure.seq}</dd></>)}
+              {task.lastFailure.sessionId !== undefined && (<><dt>会话</dt><dd><code>{task.lastFailure.sessionId}</code></dd></>)}
+              <dt>依据时间</dt><dd>{formatTime(task.lastFailure.at)}</dd>
+            </dl>
+            <p className="dk-hint">
+              {task.lastFailure.recoverable
+                ? '该失败可能可恢复：建议先「恢复」重新判定'
+                : '会话已不存在，无法重新判定；建议「重新排队」或删除该任务'}
+            </p>
+          </section>
+        )}
 
         {task.kind === 'clarify' && (
           <section className="dk-detail-section">
@@ -717,6 +914,22 @@ function TaskDetail({ task, projectTitle, waitingFor, store, backLabel, supports
             </div>
           )}
           <div className="dk-card-actions">
+            {supportsTaskRecovery && task.status === 'blocked' && task.recovery === undefined && task.sessionId !== undefined && (
+              <button
+                className="dk-btn"
+                onClick={() => { onAction({ kind: 'recover-task', projectId: task.projectId, taskId: task.id, strategy: 'reinspect' }) }}
+              >重新判定并恢复</button>
+            )}
+            {supportsTaskRecovery && task.status === 'blocked' && task.recovery === undefined && (
+              <button
+                className="dk-btn"
+                onClick={() => {
+                  if (!globalThis.confirm('重新排队会新建会话重新执行该任务，确定？')) return
+                  onAction({ kind: 'recover-task', projectId: task.projectId, taskId: task.id, strategy: 'requeue' })
+                }}
+              >重新排队执行</button>
+            )}
+            {task.recovery !== undefined && <span className="dk-hint">⏳ 恢复判定中…</span>}
             {task.kind === 'clarify' && task.status === 'awaiting-review' && (
               <button className="dk-btn dk-btn-primary" onClick={() => { onAction({ kind: 'confirm-task', projectId: task.projectId, taskId: task.id }) }}>确认回答</button>
             )}

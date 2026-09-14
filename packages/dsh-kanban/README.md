@@ -50,6 +50,7 @@ host-routes / spawner / session-runner / decomposition）+ browser 侧 jsdom
 | 任务拆解 | 设计 agent 可选写 `tasks.json`（clarify/research/design/execute，任意嵌套 + dependsOn）；人确认后物化为叶任务，依赖就绪才拉起，全部叶完成则项目完成 | — |
 | 任务终止/删除 | 任务级人工动作 `terminate-task`（尽力取消会话 + 置 blocked 留痕）与 `delete-task`（取消会话 + 移除叶子 + 解除依赖引用 + 清产物 + 重算项目完成度）；删除项目级联取消其全部会话（防泄漏）。capability `task-terminate-delete` 握手，老 host 不暴露按钮 | — |
 | 依赖关系图 | 项目详情页「子任务」区的依赖关系图视图（自绘分层布局 + SVG 连线，零新增依赖）：节点为任务叶（标题 + 类型 + 状态徽标），有向边从依赖方指向被依赖方，已完成依赖的连线弱化；「列表 / 依赖图」可切换，点击节点跳转任务详情 | `dep-graph-layout.ts` / `dep-graph.tsx` |
+| 待处理的新增任务请求 | 执行 agent 随时可写 `tasks-additions.json`（提示词鼓励），但宿主只在「execute turn 结算那一刻」消费它——结算后叶子/项目已离开观察集合，之后写入的请求曾永久孤儿化。现在：每 tick 的扫描相位**只读探测 + 冻结**（把可被覆盖写的单槽位 rename 成不可变批次文件），把待处理请求装配进快照（`pendingAdditions`，**不落账本**），看板显示「⏳ 待处理的新增任务请求（N 项）」并给出「物化到看板」一键入口；人工点击才物化（走 human any→any 边重开 done/blocked 项目），格式错误的请求则在卡上显式报错。capability `late-task-additions` 握手，老 host 不暴露入口 | `host-service.ts` / `protocol.ts` / `board.tsx` |
 | UI 挂载 | 侧边栏 DOM 注入 + 中心列 DOM 接管（`data-*` 切换） | `sidebar-entry-core.ts` / `board-mount.tsx` |
 
 ## 状态机
@@ -84,9 +85,16 @@ Actor 策略：`human` 任意→任意（人始终是最终裁决者）；`agent
   配置项 `projectsFile` 覆盖）。单写者（host service）+ 原子写穿（临时文件 +
   rename）；损坏文件改名隔离后重新起步。
 - **项目产物目录**：`<workspaceDir>/.kanban/projects/<projectId>/`，内含
-  `plan.md`（设计方案）、`tasks.json`（可选拆解清单）、`artifacts/<taskId>.md`
+  `plan.md`（设计方案）、`tasks.json`（可选拆解清单）、`tasks-additions*.json`
+  （执行 agent 的新增任务请求与其消费审计）、`artifacts/<taskId>.md`
   （research/design 叶产物）。同一 workspaceDir 下多项目互不覆盖；新一轮设计
-  清空本项目目录；删除项目连带删除目录。
+  **只**清 `plan.md` + `tasks.json`（待处理请求与 `artifacts/` 一律保留，并在
+  项目历史留一条「保留 N 个待处理请求」的说明）；删除项目连带删除目录。
+- **任务请求文件的生命周期**：`tasks-additions.json`（agent 可覆盖写的唯一槽位）
+  → 扫描相位在文件稳定后冻结为 `tasks-additions.<mtime>.pending.json`
+  → 被消费时先认领为 `…<mtime>.consuming.json` → 成功物化后落到
+  `…<mtime>.consumed.json`（同毫秒冲突时加序号，绝不覆盖既有审计）。冻结的意义：
+  同一会话写第二次时产生**新文件**而不是覆盖第一次的请求。
 - **关联项目的工作目录继承**：新建一次性项目时选中「关联长期项目」即免选工作
   目录——host 强制以父项目当前的 `workspaceDir` 作为子项目目录（调用方另传的
   值一律忽略，host 是该不变量的唯一事实源），创建历史以
@@ -110,6 +118,17 @@ Actor 策略：`human` 任意→任意（人始终是最终裁决者）；`agent
   AwaitingAcceptance。
 - **驳回循环无退出条件**：人是循环本身；后续考虑驳回次数上限。
 - **无 WIP/成本上限**：「新建即自动跑」= 自动消耗 API 额度。
+- **离场后新增任务需人工确认**：叶子/项目结算为 done/blocked 之后写入的
+  `tasks-additions.json` 不再被自动消费（系统在结算之外不擅自改账本、不擅自拉起
+  会话），只以「⏳ 待处理的新增任务请求（N 项）」呈现，点「物化到看板」才物化；
+  物化会**立即**为其中每个 execute 叶子拉起会话（真实消耗额度、真实改动仓库），
+  并让 done/blocked 项目重新进入 executing。
+- **请求槽位仍是单文件**：`tasks-additions.json` 可被 agent 覆盖写。扫描相位每
+  tick 冻结一次，因此「宿主停机期间的多次写入」与「同一 5s tick 内的两次写入」
+  仍会丢失先写的那份（被覆盖的请求不可恢复）；请求里也不记录写者身份，审计只
+  能归因到「请求文件 + 写入时间」。
+- **格式错误的请求不会被自动隔离**：文件保留原处、看板显式报错（`malformed`），
+  但要人工修好文件（本修复不做 GUI 内编辑 JSON，也不做 `.failed` 隔离命名）。
 - **嵌套树视图未做**：递归拆解已实现，但 UI 以扁平任务叶 + 标题路径
   （`父 > 子`）呈现，不按树形嵌套渲染。
 - CSS Modules 管线（lightningcss 内联 `<style data-plugin>`）暂未引入，

@@ -77,6 +77,19 @@ function applyAction(service: KanbanHostService, action: KanbanAction): unknown 
     case 'delete-task':
       service.deleteTask(action.projectId, action.taskId)
       return undefined
+    case 'recover-task':
+      // Synchronous by design: opening the door is a ledger mutation, the
+      // verdict itself is written by the spawner's next re-inspection.
+      return service.recoverTask(action.projectId, action.taskId, {
+        ...(action.strategy === undefined ? {} : { strategy: action.strategy }),
+        ...(action.note === undefined ? {} : { note: action.note }),
+      })
+    case 'materialize-additions':
+      // Human gate for requests written after a leaf was already settled:
+      // synchronous, single ledger batch, project re-opened if needed. Any
+      // failure (unknown project / nothing pending / malformed body) throws
+      // with an explanatory message → 400 + `{ ok:false, error }`.
+      return service.materializePendingAdditions(action.projectId, action.note)
   }
 }
 

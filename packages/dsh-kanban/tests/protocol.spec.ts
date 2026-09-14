@@ -98,3 +98,34 @@ describe('parseActionEnvelope terminate-task / delete-task', () => {
     expect(parseActionEnvelope(envelope({ kind: 'delete-task', projectId: 'p1', taskId: '' }))).toBeUndefined()
   })
 })
+
+describe('parseActionEnvelope recover-task', () => {
+  it('parses a minimal recover-task (the strategy default is the host\'s call)', () => {
+    const parsed = parseActionEnvelope(envelope({ kind: 'recover-task', projectId: 'p1', taskId: 't1' }))
+    expect(parsed?.action).toEqual({ kind: 'recover-task', projectId: 'p1', taskId: 't1' })
+  })
+
+  it('parses both strategies and an optional note', () => {
+    for (const strategy of ['reinspect', 'requeue'] as const) {
+      const parsed = parseActionEnvelope(envelope({
+        kind: 'recover-task', projectId: 'p1', taskId: 't1', strategy, note: '存量卡片处置',
+      }))
+      expect(parsed?.action).toEqual({ kind: 'recover-task', projectId: 'p1', taskId: 't1', strategy, note: '存量卡片处置' })
+    }
+  })
+
+  it('rejects an unknown strategy, a non-string note, and missing ids', () => {
+    expect(parseActionEnvelope(envelope({ kind: 'recover-task', projectId: 'p1', taskId: 't1', strategy: 'retry' }))).toBeUndefined()
+    expect(parseActionEnvelope(envelope({ kind: 'recover-task', projectId: 'p1', taskId: 't1', note: 42 }))).toBeUndefined()
+    expect(parseActionEnvelope(envelope({ kind: 'recover-task', projectId: 'p1' }))).toBeUndefined()
+    expect(parseActionEnvelope(envelope({ kind: 'recover-task', projectId: '', taskId: 't1' }))).toBeUndefined()
+    expect(parseActionEnvelope(envelope({ kind: 'recover-task', projectId: 'p1', taskId: '' }))).toBeUndefined()
+  })
+
+  it('an old host (unknown kind) still rejects the action, so the client gates on the capability', () => {
+    // The parser's default branch is the downgrade guarantee: a host that does
+    // not know recover-task answers 400 invalid-action instead of corrupting
+    // the ledger, which is exactly why the button is capability-gated.
+    expect(parseActionEnvelope(envelope({ kind: 'recover-task-future', projectId: 'p1', taskId: 't1' }))).toBeUndefined()
+  })
+})

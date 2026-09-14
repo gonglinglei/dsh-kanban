@@ -93,17 +93,41 @@ describe('KanbanSpawner', () => {
     expect(service.getProject(project.id)?.history.at(-1)?.note).toContain('plan.md is missing')
   })
 
-  it('blocks a failed session run', async () => {
+  it('a failed turn keeps observing; a later completed turn in the same session settles it', async () => {
     const service = makeService()
     const api = new FakeApi()
     const spawner = new KanbanSpawner(service, api)
     spawner.start()
     const project = service.createProject({ title: 't', workspaceDir: dir, goal: 'g' })
     await flush(1)
+
+    // Turn 1 fails with the production incident's shape: a recoverable quota
+    // error behind HTTP 403 (error.code = AUTH).
     api.sessions.summaries.set('sess-1', { sessionId: 'sess-1', running: false })
-    api.sessions.histories.set('sess-1', [{ event: { type: 'turn/end', seq: 1, time: Date.now() + 1, data: { reason: { kind: 'error' } } } }])
+    api.sessions.histories.set('sess-1', [{
+      event: {
+        type: 'turn/end',
+        seq: 201,
+        time: Date.now() + 1,
+        data: { turn: 1, reason: { kind: 'error', error: { message: "You've reached your 5-hour usage limit", code: 'AUTH', status: 403 } } },
+      },
+    }])
     await flush()
-    expect(service.getProject(project.id)?.status).toBe('blocked')
+    // Policy A: the leaf is NOT terminalized; the real reason is on the card.
+    expect(service.getProject(project.id)?.status).toBe('designing')
+    expect(service.getProject(project.id)?.history.at(-1)?.note).toContain('AUTH')
+    expect(service.getProject(project.id)?.history.at(-1)?.note).toContain('usage limit')
+
+    // The session is continued (a human / model switch) and turn 2 finishes.
+    writeFileSync(planPathFor(project), '# 方案', 'utf8')
+    const first = api.sessions.histories.get('sess-1')![0]!
+    api.sessions.histories.set('sess-1', [first, {
+      event: { type: 'turn/end', seq: 436, time: Date.now() + 2, data: { turn: 2, reason: { kind: 'completed' } } },
+    }])
+    await flush()
+    expect(service.getProject(project.id)?.status).toBe('awaiting-review')
+    // The already-finished session is never re-prompted (1 = the launch prompt).
+    expect(api.sessions.prompted).toHaveLength(1)
   })
 
   it('resumes the same design session on rejection, with the feedback', async () => {

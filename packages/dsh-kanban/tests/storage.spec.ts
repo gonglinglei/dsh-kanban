@@ -64,6 +64,47 @@ describe('storage', () => {
     expect(loadState(join(dir, 'projects.json.tmp'))).toEqual(emptyState())
   })
 
+  it('passes the additive failure/recovery fields through untouched (no migration)', () => {
+    // lastFailure on a project and lastFailure + recovery on a leaf are
+    // additive optional fields: the on-disk format stays 1 and a round trip
+    // must preserve them verbatim (an old ledger simply lacks them).
+    const file = join(dir, 'projects.json')
+    const failure = {
+      at: 1789026487696,
+      cause: 'turn-end' as const,
+      message: 'session s failed: AUTH (HTTP 403) quota',
+      reason: 'error',
+      code: 'AUTH',
+      status: 403,
+      turn: 1,
+      seq: 201,
+      sessionId: 's',
+      recoverable: true,
+    }
+    const project = sampleProject({ lastFailure: failure })
+    const task = {
+      id: 't1',
+      projectId: 'p1',
+      titlePath: '实现功能',
+      kind: 'execute' as const,
+      status: 'executing' as const,
+      dependencies: [],
+      lastFailure: failure,
+      recovery: { at: 5, strategy: 'reinspect' as const, sessionId: 's' },
+      version: 1,
+      createdAt: 1,
+      updatedAt: 1,
+      lastActivityAt: 1,
+      history: [],
+    }
+    saveState(file, { format: 1, revision: 3, projects: [project], tasks: [task] })
+    const loaded = loadState(file)
+    expect(loaded.projects[0]?.lastFailure).toEqual(failure)
+    expect(loaded.tasks[0]?.lastFailure).toEqual(failure)
+    expect(loaded.tasks[0]?.recovery).toEqual({ at: 5, strategy: 'reinspect', sessionId: 's' })
+    expect(loaded.format).toBe(1)
+  })
+
   it('moves a corrupt file aside and starts fresh', () => {
     const file = join(dir, 'projects.json')
     writeFileSync(file, '{not json', 'utf8')
