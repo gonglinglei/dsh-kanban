@@ -76,7 +76,7 @@ describe('GET /kanban/state', () => {
     const snapshot = (response.body as { snapshot: { capabilities?: string[] } }).snapshot
     // The client treats a missing capabilities field as「host too old」and
     // hides the long-running entry; this field must always be present.
-    expect(snapshot.capabilities).toEqual(['long-running-projects', 'parent-workspace-inheritance', 'task-terminate-delete', 'task-recovery', 'late-task-additions'])
+    expect(snapshot.capabilities).toEqual(['long-running-projects', 'parent-workspace-inheritance', 'task-terminate-delete', 'task-recovery', 'late-task-additions', 'additions-discard', 'task-archive'])
   })
 })
 

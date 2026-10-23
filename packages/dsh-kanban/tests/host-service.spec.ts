@@ -37,8 +37,8 @@ describe('KanbanHostService', () => {
     // The capability handshake rides every snapshot: the client disables
     // UI the running host does not declare, so this field must never be
     // dropped from /state or /events payloads.
-    expect(service.snapshot().capabilities).toEqual(['long-running-projects', 'parent-workspace-inheritance', 'task-terminate-delete', 'task-recovery', 'late-task-additions'])
-    expect(service.eventPayload().capabilities).toEqual(['long-running-projects', 'parent-workspace-inheritance', 'task-terminate-delete', 'task-recovery', 'late-task-additions'])
+    expect(service.snapshot().capabilities).toEqual(['long-running-projects', 'parent-workspace-inheritance', 'task-terminate-delete', 'task-recovery', 'late-task-additions', 'additions-discard', 'task-archive'])
+    expect(service.eventPayload().capabilities).toEqual(['long-running-projects', 'parent-workspace-inheritance', 'task-terminate-delete', 'task-recovery', 'late-task-additions', 'additions-discard', 'task-archive'])
   })
 
   it('fires the onEnterDesigning hook on create and on rejection', () => {

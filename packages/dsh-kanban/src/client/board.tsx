@@ -10,10 +10,13 @@
  */
 import { useEffect, useSyncExternalStore, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { FailureDiagnostic, PendingAddition, Project, ProjectStatus, TaskNode } from '../protocol.ts'
+import type {
+  ArchiveEntry, FailureDiagnostic, PendingAddition, PendingAdditionProblem, Project, ProjectStatus, TaskNode,
+} from '../protocol.ts'
 import {
-  CAPABILITY_LATE_TASK_ADDITIONS, CAPABILITY_LONG_RUNNING_PROJECTS, CAPABILITY_PARENT_WORKSPACE_INHERITANCE,
-  CAPABILITY_TASK_RECOVERY, CAPABILITY_TASK_TERMINATE_DELETE,
+  CAPABILITY_ADDITIONS_DISCARD, CAPABILITY_LATE_TASK_ADDITIONS, CAPABILITY_LONG_RUNNING_PROJECTS,
+  CAPABILITY_PARENT_WORKSPACE_INHERITANCE, CAPABILITY_TASK_ARCHIVE, CAPABILITY_TASK_RECOVERY,
+  CAPABILITY_TASK_TERMINATE_DELETE, archivedProjectIds,
 } from '../protocol.ts'
 import { DependencyGraph } from './dep-graph.tsx'
 import { ACTOR_LABELS, KIND_LABELS, STATUS_LABELS } from './labels.ts'
@@ -88,11 +91,129 @@ function materializeConfirmText(project: Project, pending: PendingAddition): str
   return `物化「${project.title}」的 ${pending.count} 项新增任务到看板${extra}${reopen}？`
 }
 
+/**
+ * The double-confirm text for discarding. It is deliberately explicit about
+ * what survives: the file is parked, not deleted — but the request will never
+ * reach the board.
+ */
+function discardConfirmText(project: Project, pending: PendingAddition): string {
+  const count = pending.state === 'malformed'
+    ? `${pending.batches} 个请求文件`
+    : `${pending.count} 项新增任务（${pending.batches} 个请求文件）`
+  return `废弃「${project.title}」的 ${count}？文件会被重命名为 *.discarded.json 留在项目目录（可人工恢复），但不会再物化到看板。`
+}
+
+/**
+ * The「废弃」entry: the only exit for a request that can never be
+ * materialized. Capability-gated by the caller — an old host would 400
+ * `discard-additions`.
+ */
+function discardButton(project: Project, pending: PendingAddition, onAction: (action: Parameters<BoardStore['apply']>[0]) => void): JSX.Element {
+  return (
+    <button
+      className="dk-btn dk-btn-danger"
+      onClick={() => {
+        if (!globalThis.confirm(discardConfirmText(project, pending))) return
+        onAction({ kind: 'discard-additions', projectId: project.id })
+      }}
+    >废弃该请求</button>
+  )
+}
+
+/**
+ * The parse failures of a request entry, as a readable chip list. A broken
+ * batch must be visible next to the healthy ones it sits with: if the host
+ * quarantines or the human discards nothing, this is the only place the
+ * failure surfaces on the board.
+ */
+function malformedChips(problems: PendingAdditionProblem[]): JSX.Element {
+  return (
+    <p className="dk-card-pending-error" title={problems.map(problem => `${problem.file}：${problem.error}`).join('\n')}>
+      ⚠ {problems.length} 个请求无法解析（{problems.map(problem => problem.file).join('、')}）
+    </p>
+  )
+}
+
 export interface BoardProps {
   store: BoardStore
   openSession(sessionId: string): void
   /** Live source of the new-project form's workspace-dir default (read when the modal opens). */
   getDefaultWorkspaceDir(): string
+}
+
+/**
+ * Whether the「归档」entry may be OFFERED on a visible project. This mirrors
+ * the host's judgement for the cases the snapshot can prove; it is not a
+ * second implementation of the rule:
+ *
+ *  - `done` (I1) and not a `long-running` container (I2) are plain fields;
+ *  - "no unfinished leaf" (I3) is decided against the VISIBLE leaves, and a
+ *    hidden leaf is always `done`, so the visible set can only under-count
+ *    unfinished work — never over-count it, which is the safe direction for a
+ *    button that the host would refuse anyway;
+ *  - I4 (a waiting `tasks-additions*` request) is deliberately NOT checked
+ *    here because it is read from disk on the host and the published assembly
+ *    field is a 5-second-old cache. Pressing the button then surfaces the
+ *    host's own reason (a 400 rendered as `error`), which is better than a
+ *    button that silently disappears and reappears.
+ */
+function canArchiveProject(project: Project, tasks: readonly TaskNode[]): boolean {
+  if (project.status !== 'done') return false
+  if (project.lifecycle === 'long-running') return false
+  return !tasks.some(task => task.projectId === project.id && task.status !== 'done')
+}
+
+/**
+ * The same question for a leaf, with the one extra rule the host enforces
+ * (I3's mirror): a leaf of a project that is itself `done` or already archived
+ * is hidden WITH that project, so offering it a separate archive would create
+ * a marker the user could never see.
+ */
+function canArchiveLeaf(task: TaskNode, project: Project, archivedProjects: ReadonlySet<string>): boolean {
+  if (task.status !== 'done') return false
+  if (task.archivedAt !== undefined) return false
+  if (archivedProjects.has(task.projectId)) return false
+  return project.status !== 'done'
+}
+
+/** The「归档」entry for one visible `done` leaf (project detail's 子任务 rows). */
+function archiveLeafButton(task: TaskNode, onAction: (action: Parameters<BoardStore['apply']>[0]) => void): JSX.Element {
+  return (
+    <button
+      className="dk-btn dk-btn-ghost"
+      onClick={() => { onAction({ kind: 'archive-task', projectId: task.projectId, taskId: task.id }) }}
+    >归档</button>
+  )
+}
+
+/**
+ * A read-only `TaskNode` standing in for one archived leaf, so the project
+ * detail's dependency graph draws the edge to a `done` provider instead of
+ * silently dropping it (`dep-graph-layout` ignores dangling ids, so the
+ * omission would be invisible rather than loud).
+ *
+ * `dependencies` is deliberately empty: an archived leaf can only ever be a
+ * dependency PROVIDER (it is `done`), and leaving the array empty keeps the
+ * layout from pulling a third layer of nodes in. It is never fed to the
+ * scheduler, which only ever looks at active leaves.
+ */
+function archivedLeafNode(entry: Extract<ArchiveEntry, { kind: 'task' }>): TaskNode {
+  return {
+    id: entry.id,
+    projectId: entry.projectId,
+    titlePath: entry.titlePath,
+    kind: entry.taskKind,
+    status: entry.status,
+    archivedAt: entry.archivedAt,
+    ...(entry.archivedBy === undefined ? {} : { archivedBy: entry.archivedBy }),
+    ...(entry.archiveNote === undefined ? {} : { archiveNote: entry.archiveNote }),
+    dependencies: [],
+    version: 0,
+    createdAt: entry.archivedAt,
+    updatedAt: entry.archivedAt,
+    lastActivityAt: entry.archivedAt,
+    history: [],
+  }
 }
 
 /**
@@ -126,6 +247,47 @@ function useOpenSession(onOpenSession: (sessionId: string) => void): { openError
     .map(candidate => candidate.titlePath.split(' > ').at(-1) ?? candidate.titlePath)
 }
 
+/**
+ * The archive list's on-demand fetch. Kept as its own hook because the
+ * snapshot cannot answer this question: the host filters archived records OUT
+ * of the snapshot, so a revision bump is the only signal that "the archive may
+ * have moved" (every archive/restore/delete is a ledger mutation and bumps it;
+ * the spawner's pending-additions push explicitly does not).
+ *
+ * Identity of the returned object matters: it is re-created on every load
+ * attempt, which is what re-runs the effect when `revision` changes.
+ */
+function useArchive(
+  store: BoardStore,
+  revision: number,
+  enabled: boolean,
+): { entries: ArchiveEntry[] | null; load: { state: 'idle' | 'loading' | 'loaded' | 'error'; error?: string } } {
+  const [entries, setEntries] = useState<ArchiveEntry[] | null>(null)
+  const [load, setLoad] = useState<{ state: 'idle' | 'loading' | 'loaded' | 'error'; error?: string }>({ state: 'idle' })
+  useEffect(() => {
+    if (!enabled) return
+    let cancelled = false
+    setLoad({ state: 'loading' })
+    store.readArchive().then(
+      archive => {
+        if (cancelled) return
+        setEntries(archive)
+        setLoad({ state: 'loaded' })
+      },
+      (error: unknown) => {
+        if (cancelled) return
+        setLoad({ state: 'error', error: error instanceof Error ? error.message : String(error) })
+      },
+    )
+    return () => { cancelled = true }
+    // `revision` is deliberate: archive, restore and delete all bump it, so a
+    // change means "re-read"; an unchanged revision means "do not re-read"
+    // (this is what keeps the 5-second pending-additions heartbeat, which never
+    // bumps the revision, from re-fetching the archive over and over).
+  }, [store, revision, enabled])
+  return { entries, load }
+}
+
 /** The board view (MVP). */
 export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps): JSX.Element {
   const snapshot = useSyncExternalStore(store.subscribe, store.getSnapshot)
@@ -137,6 +299,14 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
   // project detail keeps detailId set, so「返回」is always just
   // setDetailTaskId(null) and lands back on the project detail.
   const [detailTaskId, setDetailTaskId] = useState<string | null>(null)
+  // The archive view is one more layer of the same in-place view stack the
+  // detail views already use (no new route — the same pattern as closeBoard).
+  const [showArchive, setShowArchive] = useState(false)
+  // Only meaningful while the archive view is open: the id of the archived
+  // project whose detail page is being shown. The ledger record is a complete
+  // Project, but the snapshot filters it out, so the archive view is what
+  // supplies it — and the archive read is the only source that has it.
+  const [archiveDetailId, setArchiveDetailId] = useState<string | null>(null)
   const detailProject = detailId === null ? undefined : snapshot.projects.find(project => project.id === detailId)
   // Resolves to undefined when the task (or its whole project) disappeared
   // from the snapshot; the render chain below then falls back to the project
@@ -163,10 +333,38 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
   // (an old host would 400 it), so they are gated on BOTH the capability and a
   // non-empty assembly field.
   const supportsLateAdditions = snapshot.capabilities?.includes(CAPABILITY_LATE_TASK_ADDITIONS) ?? false
+  // …and the「废弃该请求」entry needs `discard-additions`, which is a LATER
+  // capability than the badge itself: an older host may show the badge and
+  // still not understand the discard action.
+  const supportsAdditionsDiscard = snapshot.capabilities?.includes(CAPABILITY_ADDITIONS_DISCARD) ?? false
+  // Same handshake pattern for the archive surface: the「归档 (N)」entry, the
+  // archive view and every archive/unarchive button need the host to
+  // understand all four actions, so they are all gated on this one token.
+  const supportsArchive = snapshot.capabilities?.includes(CAPABILITY_TASK_ARCHIVE) ?? false
+  // Double negative on purpose (same style as the pending-additions gate
+  // above): a host that does not declare the capability must be treated as
+  // having no archive aggregate at all, even if the field were somehow
+  // present.
+  const archivedCounts = supportsArchive ? snapshot.archivedCounts : undefined
+  // The「归档 (N)」number: the same sum the host's GET /kanban/archive returns,
+  // by P3. `undefined` counts render as 0, never as the string "undefined".
+  const archivedTotal = archivedCounts === undefined ? 0 : archivedCounts.projects + archivedCounts.tasks
+  const archivedProjects = archivedProjectIds(snapshot.projects)
   const pendingByProject = new Map<string, PendingAddition>()
   if (supportsLateAdditions) {
     for (const entry of snapshot.pendingAdditions ?? []) pendingByProject.set(entry.projectId, entry)
   }
+  // Called before any early return (hook order is unconditional) but inert
+  // until the archive view is actually open.
+  const archive = useArchive(store, snapshot.revision, showArchive)
+  // The archived project whose detail page is open, as the archive projection
+  // carries it. The projection IS the page's data source: the snapshot cannot
+  // supply the record (it is filtered out) and the projection carries exactly
+  // the fields that page renders.
+  const archiveEntry = showArchive && archiveDetailId !== null
+    ? (archive.entries ?? []).find((entry): entry is Extract<ArchiveEntry, { kind: 'project' }> =>
+      entry.kind === 'project' && entry.id === archiveDetailId)
+    : undefined
 
   if (detailTask !== undefined) {
     return (
@@ -189,12 +387,27 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
 
   return (
     <div className="dk-board">
-      {detailProject === undefined ? (
+      {detailProject === undefined && archiveEntry === undefined ? (
         <>
           <header className="dk-header">
-            <h2 className="dk-title">项目看板</h2>
+            <h2 className="dk-title">{showArchive ? '归档' : '项目看板'}</h2>
             <div style={{ display: 'flex', gap: '8px' }}>
-              <button className="dk-btn dk-btn-primary" onClick={() => { setCreating(true) }}>+ 新建项目</button>
+              {!showArchive && (
+                <button className="dk-btn dk-btn-primary" onClick={() => { setCreating(true) }}>+ 新建项目</button>
+              )}
+              {supportsArchive && (
+                <button
+                  className={showArchive ? 'dk-btn dk-btn-primary' : 'dk-btn'}
+                  onClick={() => {
+                    // Always land on the archive LIST: leaving a detail page in
+                    // the stack would make the entry look like a no-op.
+                    setShowArchive(!showArchive)
+                    setDetailId(null)
+                    setDetailTaskId(null)
+                    setArchiveDetailId(null)
+                  }}
+                >归档 ({archivedTotal})</button>
+              )}
               <button className="dk-btn" onClick={() => { closeBoard() }}>返回</button>
             </div>
           </header>
@@ -202,6 +415,17 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
           {!supportsLongRunning && (
             <p className="dk-banner">看板 host 版本过旧，不支持长期项目；请重启 DSH 后刷新页面</p>
           )}
+          {showArchive ? (
+            <ArchiveView
+              entries={archive.entries}
+              load={archive.load}
+              pendingByProject={pendingByProject}
+              supportsAdditionsDiscard={supportsAdditionsDiscard}
+              store={store}
+              onOpenProject={projectId => { setArchiveDetailId(projectId) }}
+              onAction={action => { void store.apply(action) }}
+            />
+          ) : (
           <div className="dk-columns">
             {COLUMNS.map(column => {
               const projects = snapshot.projects.filter(project => project.status === column.status)
@@ -220,6 +444,9 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
                       parentTitle={project.parentId === undefined ? undefined : snapshot.projects.find(parent => parent.id === project.parentId)?.title}
                       taskCount={snapshot.tasks.filter(task => task.projectId === project.id).length}
                       pending={pendingByProject.get(project.id)}
+                      supportsAdditionsDiscard={supportsAdditionsDiscard}
+                      supportsArchive={supportsArchive}
+                      archivable={canArchiveProject(project, snapshot.tasks)}
                       rejecting={rejectingId === project.id}
                       onToggleReject={() => { setRejectingId(rejectingId === project.id ? null : project.id) }}
                       onAction={action => { void store.apply(action) }}
@@ -244,8 +471,20 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
               )
             })}
           </div>
+          )}
         </>
-      ) : (
+      ) : archiveEntry !== undefined ? (
+        <ArchivedProjectDetail
+          entry={archiveEntry}
+          onBack={() => { setArchiveDetailId(null) }}
+          onAction={action => {
+            void store.apply(action)
+            // Deleting from the archive page drops the record entirely, so
+            // there is nothing left to keep in the view stack.
+            if (action.kind === 'delete-project') { setArchiveDetailId(null); setDetailId(null) }
+          }}
+        />
+      ) : detailProject === undefined ? null : (
         <ProjectDetail
           project={detailProject}
           tasks={snapshot.tasks.filter(task => task.projectId === detailProject.id)}
@@ -253,6 +492,9 @@ export function Board({ store, openSession, getDefaultWorkspaceDir }: BoardProps
           childProjects={snapshot.projects.filter(candidate => candidate.parentId === detailProject.id)}
           pending={pendingByProject.get(detailProject.id)}
           supportsLateAdditions={supportsLateAdditions}
+          supportsAdditionsDiscard={supportsAdditionsDiscard}
+          supportsArchive={supportsArchive}
+          snapshotRevision={snapshot.revision}
           store={store}
           onBack={() => { setDetailId(null) }}
           onOpenProjectDetail={projectId => { setDetailId(projectId) }}
@@ -304,6 +546,12 @@ interface ProjectCardProps {
    * untouched and an old host simply renders nothing.
    */
   pending?: PendingAddition
+  /** Host capability handshake: old hosts 400 `discard-additions`. */
+  supportsAdditionsDiscard: boolean
+  /** Host capability handshake: old hosts 400 the archive actions. */
+  supportsArchive: boolean
+  /** Whether the「归档」entry may be offered (see canArchiveProject). */
+  archivable: boolean
   rejecting: boolean
   onToggleReject(): void
   onAction(action: Parameters<BoardStore['apply']>[0]): void
@@ -311,7 +559,7 @@ interface ProjectCardProps {
   onOpenDetail(): void
 }
 
-function ProjectCard({ project, parentTitle, taskCount, pending, rejecting, onToggleReject, onAction, onOpenSession, onOpenDetail }: ProjectCardProps): JSX.Element {
+function ProjectCard({ project, parentTitle, taskCount, pending, supportsAdditionsDiscard, supportsArchive, archivable, rejecting, onToggleReject, onAction, onOpenSession, onOpenDetail }: ProjectCardProps): JSX.Element {
   const { openError, open } = useOpenSession(onOpenSession)
   const handleOpenSession = (): void => { open(project.sessionId!) }
   const sessionChip = project.sessionId !== undefined
@@ -345,6 +593,7 @@ function ProjectCard({ project, parentTitle, taskCount, pending, rejecting, onTo
           title={badge.title}
         >{badge.text}</p>
       )}
+      {pending !== undefined && (pending.malformed?.length ?? 0) > 0 && pending.state !== 'malformed' && malformedChips(pending.malformed!)}
       {project.status === 'blocked' && project.lastFailure !== undefined && (
         <p className="dk-card-failure" title={failureChipText(project.lastFailure)}>{failureChipText(project.lastFailure)}</p>
       )}
@@ -360,11 +609,24 @@ function ProjectCard({ project, parentTitle, taskCount, pending, rejecting, onTo
           <button className="dk-btn" onClick={() => { onAction({ kind: 'transition', projectId: project.id, to: 'designing', note: 're-design from blocked' }) }}>重新设计</button>
         )}
         {(project.status === 'designing' || project.status === 'executing' || project.status === 'done') && sessionChip}
-        {pending !== undefined && (badge!.malformed
-          ? <button className="dk-btn" disabled title="修复请求文件后再试；格式错误的请求不会被物化">无法物化（请求格式错误）</button>
-          : <button className="dk-btn dk-btn-primary" onClick={handleMaterialize}>物化到看板</button>
+        {pending !== undefined && (pending.state === 'malformed'
+          ? (supportsAdditionsDiscard
+            ? discardButton(project, pending, onAction)
+            : <button className="dk-btn" disabled title="修复请求文件后再试；格式错误的请求不会被物化">无法物化（请求格式错误）</button>)
+          : (
+            <>
+              <button className="dk-btn dk-btn-primary" onClick={handleMaterialize}>物化到看板</button>
+              {supportsAdditionsDiscard && discardButton(project, pending, onAction)}
+            </>
+          )
         )}
         <button className="dk-btn dk-btn-ghost" onClick={onOpenDetail}>详情</button>
+        {supportsArchive && archivable && (
+          <button
+            className="dk-btn dk-btn-ghost"
+            onClick={() => { onAction({ kind: 'archive-project', projectId: project.id }) }}
+          >归档</button>
+        )}
         <button
           className="dk-btn dk-btn-ghost"
           onClick={() => { if (globalThis.confirm(`删除项目「${project.title}」？`)) onAction({ kind: 'delete-project', projectId: project.id }) }}
@@ -377,6 +639,177 @@ function ProjectCard({ project, parentTitle, taskCount, pending, rejecting, onTo
         />
       )}
     </article>
+  )
+}
+
+interface ArchiveViewProps {
+  /** null = not loaded yet; the load state distinguishes "loading" from "empty". */
+  entries: ArchiveEntry[] | null
+  load: { state: 'idle' | 'loading' | 'loaded' | 'error'; error?: string }
+  /** The published pending-additions entries, so an archived project's request stays visible. */
+  pendingByProject: Map<string, PendingAddition>
+  supportsAdditionsDiscard: boolean
+  store: BoardStore
+  onOpenProject(projectId: string): void
+  onAction(action: Parameters<BoardStore['apply']>[0]): void
+}
+
+/**
+ * The archive view: the only place archived records are visible, and the only
+ * place a project can be deleted from once it is archived (the board path
+ * cannot even reach it — the snapshot no longer contains it).
+ *
+ * It renders from the PROJECTION (`ArchiveEntry`), which deliberately carries
+ * no `history`. Consequence, kept on purpose: a leaf entry offers no「详情」
+ * button, because a task detail would open an empty timeline — an entry that
+ * points at nothing is worse than no entry.
+ */
+function ArchiveView({ entries, load, pendingByProject, supportsAdditionsDiscard, store, onOpenProject, onAction }: ArchiveViewProps): JSX.Element {
+  // P2's view-side mirror: a leaf whose owning project is itself archived was
+  // hidden WITH that project (it carries no marker of its own), so drawing it
+  // as an individually restorable row would offer a restore with no visible
+  // effect. The host's projection already excludes those; this is the client's
+  // minimum defence against drawing dirty data.
+  const visible = (entries ?? []).filter(entry => {
+    if (entry.kind !== 'task') return true
+    return !(entries ?? []).some(other => other.kind === 'project' && other.id === entry.projectId)
+  })
+  return (
+    // `dk-detail-body` normally sizes itself inside a `dk-detail`; here it is a
+    // direct child of the board (flex column) under the shared header, so it
+    // needs the explicit grow/shrink pair to scroll instead of overflowing.
+    <div className="dk-detail-body" style={{ flex: '1 1 auto', minHeight: 0 }}>
+      <section className="dk-detail-section">
+        <p className="dk-hint dk-archive-summary">
+          归档只是从看板移出：记录仍在账本里，产物文件原样保留，随时可以恢复。
+        </p>
+        {load.state === 'error' && <p className="dk-card-error">归档读取失败：{load.error ?? '未知错误'}</p>}
+        {load.state === 'loading' && <p className="dk-empty">加载中…</p>}
+        {load.state !== 'loading' && load.state !== 'error' && visible.length === 0 && (
+          <p className="dk-empty">暂无归档记录。已完成的节点超过保留窗口后会自动归档。</p>
+        )}
+        {visible.map(entry => entry.kind === 'project'
+          ? archivedProjectRow(entry, pendingByProject, supportsAdditionsDiscard, store, onOpenProject, onAction)
+          : archivedTaskRow(entry, onAction))}
+      </section>
+    </div>
+  )
+}
+
+/**
+ * The archive list's version of the materialize confirmation. `ArchiveEntry`
+ * is a projection (no `sessionId`, no `lifecycle`), so the shared
+ * `materializeConfirmText` cannot take it directly; the wording that matters
+ * here is only "how many execute leaves will really start a session" and
+ * whether the project will re-open, and an archived project is always `done`.
+ */
+function archivedMaterializeConfirmText(entry: Extract<ArchiveEntry, { kind: 'project' }>, pending: PendingAddition): string {
+  const executeCount = pending.items?.filter(item => item.kind === 'execute').length ?? 0
+  const extra = executeCount > 0 ? `，并立即为其中 ${executeCount} 个执行叶子拉起会话（真实消耗额度、真实改动仓库）` : ''
+  return `物化「${entry.title}」的 ${pending.count} 项新增任务到看板${extra}（项目将从「${STATUS_LABELS[entry.status]}」重新进入执行中）`
+}
+
+/**
+ * The archive list's version of the discard confirmation — same wording, same
+ * reason, but built from the projection (see above).
+ */
+function archivedDiscardConfirmText(entry: Extract<ArchiveEntry, { kind: 'project' }>, pending: PendingAddition): string {
+  const count = pending.state === 'malformed'
+    ? `${pending.batches} 个请求文件`
+    : `${pending.count} 项新增任务（${pending.batches} 个请求文件）`
+  return `废弃「${entry.title}」的 ${count}？文件会被重命名为 *.discarded.json 留在项目目录（可人工恢复），但不会再物化到看板。`
+}
+
+/**
+ * One archived project row. Its「详情」entry is real (the caller holds the
+ * entry, which is a complete `Project`), unlike the leaf row's.
+ */
+function archivedProjectRow(
+  entry: Extract<ArchiveEntry, { kind: 'project' }>,
+  pendingByProject: Map<string, PendingAddition>,
+  supportsAdditionsDiscard: boolean,
+  store: BoardStore,
+  onOpenProject: (projectId: string) => void,
+  onAction: (action: Parameters<BoardStore['apply']>[0]) => void,
+): JSX.Element {
+  const pending = pendingByProject.get(entry.projectId)
+  const badge = pending === undefined ? undefined : pendingBadge(pending)
+  return (
+    <div className="dk-detail-task dk-archive-row" key={entry.id}>
+      <div className="dk-card-meta">
+        <span className="dk-kind-badge">项目</span>
+        {entry.archivedBy !== undefined && <> · {ACTOR_LABELS[entry.archivedBy]}归档</>}
+        {entry.taskCount > 0 && <> · 含子任务 {entry.taskCount}</>}
+      </div>
+      <p className="dk-detail-task-path">{entry.title}</p>
+      {entry.parentTitle !== undefined && <p className="dk-card-parent">隶属于 {entry.parentTitle}</p>}
+      <p className="dk-hint dk-archive-time">
+        {formatTime(entry.archivedAt)}{entry.archiveNote !== undefined ? ` · ${entry.archiveNote}` : ''}
+      </p>
+      {badge !== undefined && (
+        <p
+          className={badge.malformed ? 'dk-card-pending-error' : 'dk-card-pending'}
+          title={badge.title}
+        >{badge.text}</p>
+      )}
+      {pending !== undefined && (pending.malformed?.length ?? 0) > 0 && pending.state !== 'malformed' && malformedChips(pending.malformed!)}
+      <div className="dk-card-actions">
+        {pending !== undefined && pending.state !== 'malformed' && (
+          <button
+            className="dk-btn dk-btn-primary"
+            onClick={() => {
+              if (!globalThis.confirm(archivedMaterializeConfirmText(entry, pending))) return
+              onAction({ kind: 'materialize-additions', projectId: entry.id })
+            }}
+          >物化到看板</button>
+        )}
+        {pending !== undefined && pending.state === 'malformed' && supportsAdditionsDiscard && (
+          <button
+            className="dk-btn dk-btn-danger"
+            onClick={() => {
+              if (!globalThis.confirm(archivedDiscardConfirmText(entry, pending))) return
+              onAction({ kind: 'discard-additions', projectId: entry.id })
+            }}
+          >废弃该请求</button>
+        )}
+        <button className="dk-btn dk-btn-ghost" onClick={() => { onOpenProject(entry.id) }}>详情</button>
+        <button className="dk-btn dk-btn-primary" onClick={() => { onAction({ kind: 'unarchive-project', projectId: entry.id }) }}>恢复</button>
+        <button
+          className="dk-btn dk-btn-ghost"
+          onClick={() => { if (globalThis.confirm(`删除项目「${entry.title}」？`)) onAction({ kind: 'delete-project', projectId: entry.id }) }}
+        >删除</button>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * One archived leaf row (form C: a `done` leaf of a project that is still on
+ * the board). No「详情」button — see ArchiveView's note on the projection.
+ */
+function archivedTaskRow(
+  entry: Extract<ArchiveEntry, { kind: 'task' }>,
+  onAction: (action: Parameters<BoardStore['apply']>[0]) => void,
+): JSX.Element {
+  return (
+    <div className="dk-detail-task dk-archive-row" key={entry.id}>
+      <div className="dk-card-meta">
+        <span className="dk-kind-badge">子任务</span>
+        {' '}<span className="dk-kind-badge">{KIND_LABELS[entry.taskKind]}</span>
+        {entry.archivedBy !== undefined && <> · {ACTOR_LABELS[entry.archivedBy]}归档</>}
+      </div>
+      <p className="dk-detail-task-path">{entry.titlePath}</p>
+      <p className="dk-card-parent">属于 {entry.projectTitle}</p>
+      <p className="dk-hint dk-archive-time">
+        {formatTime(entry.archivedAt)}{entry.archiveNote !== undefined ? ` · ${entry.archiveNote}` : ''}
+      </p>
+      <div className="dk-card-actions">
+        <button
+          className="dk-btn dk-btn-primary"
+          onClick={() => { onAction({ kind: 'unarchive-task', projectId: entry.projectId, taskId: entry.id }) }}
+        >恢复</button>
+      </div>
+    </div>
   )
 }
 
@@ -499,6 +932,12 @@ interface ProjectDetailProps {
   pending?: PendingAddition
   /** Host capability handshake: old hosts 400 `materialize-additions`. */
   supportsLateAdditions: boolean
+  /** Host capability handshake: old hosts 400 `discard-additions`. */
+  supportsAdditionsDiscard: boolean
+  /** Host capability handshake: old hosts 400 the archive actions, so those entries hide. */
+  supportsArchive: boolean
+  /** The snapshot's revision — the signal that this project's archive cluster may have moved. */
+  snapshotRevision: number
   store: BoardStore
   onBack(): void
   onAction(action: Parameters<BoardStore['apply']>[0]): void
@@ -510,12 +949,68 @@ interface ProjectDetailProps {
 }
 
 /**
+ * The detail page of one ARCHIVED project. Deliberately a smaller page than
+ * `ProjectDetail`: the archive read serves a projection (no `history`, no
+ * `goal` beyond the projection, no plan), so there is nothing to render for
+ * the plan preview or the transition timeline. Restoring is one click away,
+ * and that is the documented path to the full view.
+ *
+ * The「恢复」button is the same round trip `ProjectDetail` offers, so an
+ * archived project can be brought back from whichever page the user is on.
+ */
+function ArchivedProjectDetail({ entry, onBack, onAction }: {
+  entry: Extract<ArchiveEntry, { kind: 'project' }>
+  onBack(): void
+  onAction(action: Parameters<BoardStore['apply']>[0]): void
+}): JSX.Element {
+  return (
+    <div className="dk-detail">
+      <header className="dk-header">
+        <h2 className="dk-title">{entry.title}</h2>
+        <button className="dk-btn" onClick={onBack}>返回归档</button>
+      </header>
+      <p className="dk-banner">
+        该项目已归档：记录仍在账本中，产物文件原样保留。恢复后会回到看板的「已完成」列。
+      </p>
+      <div className="dk-detail-body">
+        <section className="dk-detail-section">
+          <h3 className="dk-detail-heading">归档信息</h3>
+          <dl className="dk-detail-grid">
+            <dt>状态</dt><dd><span className="dk-kind-badge">{STATUS_LABELS[entry.status]}</span></dd>
+            {entry.parentTitle !== undefined && (
+              <>
+                <dt>所属长期项目</dt><dd>{entry.parentTitle}</dd>
+              </>
+            )}
+            <dt>归档时间</dt><dd>{formatTime(entry.archivedAt)}</dd>
+            <dt>归档人</dt><dd>{entry.archivedBy === undefined ? '未知' : ACTOR_LABELS[entry.archivedBy]}</dd>
+            <dt>归档原因</dt><dd>{entry.archiveNote ?? '（未记录）'}</dd>
+            <dt>子任务数</dt><dd>{entry.taskCount}</dd>
+          </dl>
+          <p className="dk-hint">归档项目不提供方案预览与流转历史；恢复后即可在项目详情里查看。</p>
+        </section>
+        <section className="dk-detail-section">
+          <h3 className="dk-detail-heading">操作</h3>
+          <div className="dk-card-actions">
+            <button className="dk-btn dk-btn-primary" onClick={() => { onAction({ kind: 'unarchive-project', projectId: entry.id }) }}>恢复</button>
+            <button
+              className="dk-btn dk-btn-ghost"
+              onClick={() => { if (globalThis.confirm(`删除项目「${entry.title}」？`)) onAction({ kind: 'delete-project', projectId: entry.id }) }}
+            >删除</button>
+          </div>
+        </section>
+      </div>
+    </div>
+  )
+}
+
+/**
  * The full-screen project detail view, switched inside the board container
  * (no new route — same pattern as closeBoard). Five sections: basic info,
  * plan preview (fetched on demand through the /kanban/file route), task
  * leaves, transition history, and the same action set as the card.
  */
-function ProjectDetail({ project, tasks, parentTitle, childProjects, pending, supportsLateAdditions, store, onBack, onAction, onOpenSession, onOpenProjectDetail, onOpenTaskDetail }: ProjectDetailProps): JSX.Element {
+function ProjectDetail({ project, tasks, parentTitle, childProjects, pending, supportsLateAdditions, supportsAdditionsDiscard, supportsArchive, snapshotRevision, store, onBack, onAction, onOpenSession, onOpenProjectDetail, onOpenTaskDetail }: ProjectDetailProps): JSX.Element {
   const [rejecting, setRejecting] = useState(false)
   const { openError, open } = useOpenSession(onOpenSession)
   // Capability-gated twice on purpose: an old host would 400 the action, so
@@ -530,6 +1025,55 @@ function ProjectDetail({ project, tasks, parentTitle, childProjects, pending, su
   const [tasksView, setTasksView] = useState<'list' | 'graph'>(() =>
     tasks.length >= 2 && tasks.some(task => task.dependencies.length > 0) ? 'graph' : 'list'
   )
+
+  /**
+   * Compensation read of this project's archive cluster. The snapshot filters
+   * archived records out, so without this an active long-running container
+   * would silently lose its finished children the moment the sweep archives
+   * them, and a visible project's archived leaves would vanish from its graph.
+   *
+   * Read failure is handled by DEGRADING TO THE ACTIVE SET (empty merge + a
+   * hint), never by blocking the page: the archive is a supplement here, and a
+   * detail page that cannot render because an optional read failed is a worse
+   * outcome than a detail page that is missing its archived rows.
+   */
+  const [archived, setArchived] = useState<ArchiveEntry[] | null>(null)
+  const [archiveLoadError, setArchiveLoadError] = useState<string | undefined>(undefined)
+  const revision = snapshotRevision
+  useEffect(() => {
+    if (!supportsArchive) return
+    let cancelled = false
+    store.readArchive(project.id).then(
+      entries => {
+        if (cancelled) return
+        setArchived(entries)
+        setArchiveLoadError(undefined)
+      },
+      (error: unknown) => {
+        if (cancelled) return
+        setArchived([])
+        setArchiveLoadError(error instanceof Error ? error.message : String(error))
+      },
+    )
+    return () => { cancelled = true }
+    // `revision`: a restore/archive anywhere may have moved this project's cluster.
+  }, [project.id, revision, supportsArchive, store])
+
+  // A leaf whose project is archived is hidden WITH the project, so it must
+  // never be merged back in as if it were an individual archive. The host's
+  // projection already excludes those; this is the client's minimum defence
+  // against drawing dirty data (P2's view-side mirror).
+  const archivedTasks = (archived ?? []).filter((entry): entry is Extract<ArchiveEntry, { kind: 'task' }> =>
+    entry.kind === 'task' && entry.projectId === project.id
+  )
+  const archivedChildren = (archived ?? [])
+    .filter((entry): entry is Extract<ArchiveEntry, { kind: 'project' }> => entry.kind === 'project')
+    .sort((left, right) => right.archivedAt - left.archivedAt)
+  // The graph needs the archived leaves as `done` providers, or every edge to
+  // them is dropped as dangling and the structure quietly loses a node.
+  const graphTasks = archivedTasks.length === 0 ? tasks : [...tasks, ...archivedTasks.map(archivedLeafNode)]
+  const archivedProjectsOfThis = archivedProjectIds([project])
+  const canArchiveThisLeaf = (task: TaskNode): boolean => canArchiveLeaf(task, project, archivedProjectsOfThis)
 
   // Fetch the plan artifact on demand; it deliberately stays out of the
   // snapshot (the file can be large and changes outside the ledger).
@@ -596,7 +1140,10 @@ function ProjectDetail({ project, tasks, parentTitle, childProjects, pending, su
             {pendingRequest.state === 'malformed' ? (
               <>
                 <p className="dk-card-pending-error">⚠ 无法解析：{pendingRequest.error ?? '未知错误'}</p>
-                <p className="dk-hint">文件保留在项目目录中；修复后下一个轮询周期会自动重新检测</p>
+                <p className="dk-hint">
+                  文件保留在项目目录中；修复后下一个轮询周期会自动重新检测。
+                  {supportsAdditionsDiscard ? '不再需要这份请求时可直接废弃。' : '当前 host 不支持在看板上废弃，只能人工改文件。'}
+                </p>
               </>
             ) : (
               <>
@@ -612,20 +1159,29 @@ function ProjectDetail({ project, tasks, parentTitle, childProjects, pending, su
                 {pendingRequest.count > (pendingRequest.items?.length ?? 0) && (
                   <p className="dk-hint">…另有 {pendingRequest.count - (pendingRequest.items?.length ?? 0)} 项未展开</p>
                 )}
+                {(pendingRequest.malformed ?? []).map(problem => (
+                  <p className="dk-card-pending-error" key={problem.file}>
+                    ⚠ {problem.file} 无法解析：{problem.error}
+                  </p>
+                ))}
+                {(pendingRequest.malformed?.length ?? 0) > 0 && (
+                  <p className="dk-hint">无法解析的请求不会被物化，会原样保留在项目目录中（可修复后重新物化，或直接废弃）。</p>
+                )}
               </>
             )}
             <div className="dk-card-actions">
-              {pendingRequest.state === 'malformed'
-                ? <button className="dk-btn" disabled>无法物化（请求格式错误）</button>
-                : (
-                  <button
-                    className="dk-btn dk-btn-primary"
-                    onClick={() => {
-                      if (!globalThis.confirm(materializeConfirmText(project, pendingRequest))) return
-                      onAction({ kind: 'materialize-additions', projectId: project.id })
-                    }}
-                  >物化到看板</button>
-                )}
+              {pendingRequest.state !== 'malformed' && (
+                <button
+                  className="dk-btn dk-btn-primary"
+                  onClick={() => {
+                    if (!globalThis.confirm(materializeConfirmText(project, pendingRequest))) return
+                    onAction({ kind: 'materialize-additions', projectId: project.id })
+                  }}
+                >物化到看板</button>
+              )}
+              {supportsAdditionsDiscard
+                ? discardButton(project, pendingRequest, onAction)
+                : (pendingRequest.state === 'malformed' ? <button className="dk-btn" disabled>无法物化（请求格式错误）</button> : null)}
             </div>
           </section>
         )}
@@ -648,8 +1204,8 @@ function ProjectDetail({ project, tasks, parentTitle, childProjects, pending, su
 
         <section className="dk-detail-section">
           <div className="dk-detail-heading-row">
-            <h3 className="dk-detail-heading">子任务({tasks.length})</h3>
-            {tasks.length > 0 && (
+            <h3 className="dk-detail-heading">子任务({tasks.length + archivedTasks.length})</h3>
+            {tasks.length + archivedTasks.length > 0 && (
               <div className="dk-view-toggle">
                 <button
                   className={tasksView === 'list' ? 'dk-btn dk-btn-primary' : 'dk-btn'}
@@ -662,38 +1218,98 @@ function ProjectDetail({ project, tasks, parentTitle, childProjects, pending, su
               </div>
             )}
           </div>
-          {tasks.length === 0 ? <p className="dk-empty">尚无子任务</p> : tasksView === 'graph' ? (
-            <DependencyGraph tasks={tasks} onOpenTaskDetail={onOpenTaskDetail} />
-          ) : tasks.map(task => (
-            <div className="dk-detail-task" key={task.id}>
-              <div className="dk-card-meta">
-                <span className="dk-kind-badge">{KIND_LABELS[task.kind]}</span>
-                {' '}<span className="dk-kind-badge">{STATUS_LABELS[task.status]}</span>
-              </div>
-              <p className="dk-detail-task-path">{task.titlePath}</p>
-              {task.question !== undefined && <p className="dk-card-goal">❓ {task.question}</p>}
-              {task.answer !== undefined && <p className="dk-card-goal">✅ {task.answer}</p>}
-              <div className="dk-card-actions">
-                <button className="dk-btn dk-btn-ghost" onClick={() => { onOpenTaskDetail(task.id) }}>详情</button>
-              </div>
-            </div>
-          ))}
+          {archiveLoadError !== undefined && (
+            <p className="dk-hint">归档条目读取失败，当前仅显示活跃项。</p>
+          )}
+          {tasks.length + archivedTasks.length === 0 ? <p className="dk-empty">尚无子任务</p> : tasksView === 'graph' ? (
+            <DependencyGraph tasks={graphTasks} onOpenTaskDetail={onOpenTaskDetail} />
+          ) : (
+            <>
+              {tasks.map(task => (
+                <div className="dk-detail-task" key={task.id}>
+                  <div className="dk-card-meta">
+                    <span className="dk-kind-badge">{KIND_LABELS[task.kind]}</span>
+                    {' '}<span className="dk-kind-badge">{STATUS_LABELS[task.status]}</span>
+                  </div>
+                  <p className="dk-detail-task-path">{task.titlePath}</p>
+                  {task.question !== undefined && <p className="dk-card-goal">❓ {task.question}</p>}
+                  {task.answer !== undefined && <p className="dk-card-goal">✅ {task.answer}</p>}
+                  <div className="dk-card-actions">
+                    <button className="dk-btn dk-btn-ghost" onClick={() => { onOpenTaskDetail(task.id) }}>详情</button>
+                    {supportsArchive && canArchiveThisLeaf(task) && archiveLeafButton(task, onAction)}
+                  </div>
+                </div>
+              ))}
+              {/* Archived rows come after the active ones: the list stays a
+                  stable read of "current work first, history below". */}
+              {archivedTasks.map(entry => (
+                <div className="dk-detail-task dk-archive-row" key={entry.id}>
+                  <div className="dk-card-meta">
+                    <span className="dk-kind-badge">已归档</span>
+                    {' '}<span className="dk-kind-badge">{KIND_LABELS[entry.taskKind]}</span>
+                  </div>
+                  <p className="dk-detail-task-path">{entry.titlePath}</p>
+                  <p className="dk-hint dk-archive-time">
+                    {formatTime(entry.archivedAt)}{entry.archiveNote !== undefined ? ` · ${entry.archiveNote}` : ''}
+                  </p>
+                  <div className="dk-card-actions">
+                    {supportsArchive && (
+                      <button
+                        className="dk-btn dk-btn-primary"
+                        onClick={() => { onAction({ kind: 'unarchive-task', projectId: entry.projectId, taskId: entry.id }) }}
+                      >恢复</button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
         </section>
 
         {project.lifecycle === 'long-running' && (
           <section className="dk-detail-section">
-            <h3 className="dk-detail-heading">名下子项目({childProjects.length})</h3>
-            {childProjects.length === 0 ? <p className="dk-empty">尚无子项目</p> : childProjects.map(child => (
-              <div className="dk-detail-task" key={child.id}>
-                <div className="dk-card-meta">
-                  <span className="dk-kind-badge">{STATUS_LABELS[child.status]}</span>
-                </div>
-                <p className="dk-detail-task-path">{child.title}</p>
-                <div className="dk-card-actions">
-                  <button className="dk-btn dk-btn-ghost" onClick={() => { onOpenProjectDetail(child.id) }}>详情</button>
-                </div>
-              </div>
-            ))}
+            <h3 className="dk-detail-heading">名下子项目({childProjects.length + archivedChildren.length})</h3>
+            {childProjects.length + archivedChildren.length === 0 ? <p className="dk-empty">尚无子项目</p> : (
+              <>
+                {childProjects.map(child => (
+                  <div className="dk-detail-task" key={child.id}>
+                    <div className="dk-card-meta">
+                      <span className="dk-kind-badge">{STATUS_LABELS[child.status]}</span>
+                    </div>
+                    <p className="dk-detail-task-path">{child.title}</p>
+                    <div className="dk-card-actions">
+                      <button className="dk-btn dk-btn-ghost" onClick={() => { onOpenProjectDetail(child.id) }}>详情</button>
+                    </div>
+                  </div>
+                ))}
+                {archivedChildren.map(entry => (
+                  <div className="dk-detail-task dk-archive-row" key={entry.id}>
+                    <div className="dk-card-meta">
+                      <span className="dk-kind-badge">已归档</span>
+                      {' '}<span className="dk-kind-badge">{STATUS_LABELS[entry.status]}</span>
+                    </div>
+                    <p className="dk-detail-task-path">{entry.title}</p>
+                    <p className="dk-hint dk-archive-time">
+                      {formatTime(entry.archivedAt)}{entry.archiveNote !== undefined ? ` · ${entry.archiveNote}` : ''}
+                    </p>
+                    <div className="dk-card-actions">
+                      {supportsArchive && (
+                        <button
+                          className="dk-btn dk-btn-ghost"
+                          onClick={() => { onOpenProjectDetail(entry.id) }}
+                        >详情</button>
+                      )}
+                      {supportsArchive && (
+                        <button
+                          className="dk-btn dk-btn-primary"
+                          onClick={() => { onAction({ kind: 'unarchive-project', projectId: entry.id }) }}
+                        >恢复</button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </>
+            )}
           </section>
         )}
 

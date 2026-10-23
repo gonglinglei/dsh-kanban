@@ -90,6 +90,22 @@ function applyAction(service: KanbanHostService, action: KanbanAction): unknown 
       // failure (unknown project / nothing pending / malformed body) throws
       // with an explanatory message → 400 + `{ ok:false, error }`.
       return service.materializePendingAdditions(action.projectId, action.note)
+    case 'discard-additions':
+      // The other half of the human gate: throw the request away instead. It
+      // touches no leaf, no session and no status — a done project stays done.
+      return service.discardPendingAdditions(action.projectId, action.note)
+    case 'archive-project':
+      // Archive / restore are ledger metadata commits: they never start or
+      // cancel a session, never change a status and never delete a file. A
+      // rejection (not done, long-running container, unfinished leaves, a
+      // materializable additions request) throws and lands as 400 below.
+      return service.archiveProject(action.projectId, action.note)
+    case 'unarchive-project':
+      return service.unarchiveProject(action.projectId, action.note)
+    case 'archive-task':
+      return service.archiveTask(action.projectId, action.taskId, action.note)
+    case 'unarchive-task':
+      return service.unarchiveTask(action.projectId, action.taskId, action.note)
   }
 }
 
@@ -199,5 +215,33 @@ export function makeKanbanRoutes(service: KanbanHostService): WebRoute[] {
     },
   }
 
-  return [state, action, events, file, health]
+  /**
+   * Read the archived records (on-demand detail read; deliberately NOT part of
+   * the hot snapshot). `?projectId=` narrows it to one cluster — the display
+   * page of an active project uses it to pull back the archived siblings it
+   * needs to render a complete dependency graph. Read-only: it never writes the
+   * ledger. An unknown id is an empty list, not a 404: for a read view "no such
+   * project" and "nothing archived here" are the same answer, and a 404 would
+   * force a pointless error branch on the client.
+   */
+  const archive: WebRoute = {
+    kind: 'exact',
+    path: `${KANBAN_API_PREFIX}/archive`,
+    handler: (req, res): void => {
+      if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method-not-allowed' })
+      if (!guard(req, res)) return
+      const url = new URL(req.url ?? '', 'http://localhost')
+      const raw = url.searchParams.get('projectId')
+      // Blank is malformed, not "no filter": the client either omits the
+      // parameter or passes a real id (same strictness as /file's `path`).
+      if (raw !== null && raw.trim() === '') return json(res, 400, { ok: false, error: 'projectId-blank' })
+      try {
+        json(res, 200, { ok: true, archive: service.archiveEntries(raw ?? undefined) })
+      } catch (error) {
+        json(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) })
+      }
+    },
+  }
+
+  return [state, action, events, file, health, archive]
 }

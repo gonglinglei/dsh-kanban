@@ -4,7 +4,7 @@
  * lands through the transport subscription. Framework-free — the React view
  * reads it with useSyncExternalStore.
  */
-import type { KanbanAction, KanbanSnapshot } from '../protocol.ts'
+import type { ArchiveEntry, KanbanAction, KanbanSnapshot } from '../protocol.ts'
 import type { KanbanHostTransport } from './host-api.ts'
 
 export class BoardStore {
@@ -72,6 +72,17 @@ export class BoardStore {
   /** Read one project artifact through the transport (detail view's plan preview; not cached in the snapshot). */
   async readFile(path: string): Promise<string> {
     return this.transport.file(path)
+  }
+
+  /**
+   * Read the archived records through the transport (the archive view's list;
+   * deliberately not cached in the snapshot — the same rule as readFile).
+   * @param projectId - narrow to one project's cluster. Omit for "everything":
+   *   the route treats a blank string as malformed, so this method must never
+   *   substitute a default of its own.
+   */
+  async readArchive(projectId?: string): Promise<ArchiveEntry[]> {
+    return this.transport.archive(projectId)
   }
 
   /** Send one human action; the host's response snapshot becomes the new view. */

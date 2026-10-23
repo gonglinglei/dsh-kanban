@@ -14,10 +14,10 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { ISessions } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { IWorkspaces } from '@deepseek-ai/dsh-api-workspace-controller/client'
-import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import { mountBoard } from './board-mount.tsx'
 import { HttpKanbanHostTransport } from './host-api.ts'
 import { defaultWorkspaceDir } from './last-workspace-dir.ts'
+import { openSessionInShell } from './open-session.ts'
 import { mountSidebarEntry } from './sidebar-entry.ts'
 import { BoardStore } from './store.ts'
 import { toggleBoard } from './view-state.ts'
@@ -48,17 +48,11 @@ export function apply(ctx: Context): void {
   const workspaces = ctx.get('workspaces') as unknown as IWorkspaces
 
   const store = new BoardStore(new HttpKanbanHostTransport())
+  // Session navigation is feature-detected inside: 0.2.1+ shells expose it as
+  // ctx.uiWorkspace.openSession, older shells as sessions.open (the Desktop app
+  // auto-update 0.2.0 → 0.2.1 removed the latter).
   const openSession = (sessionId: string): void => {
-    // sessions.open only accepts sessions of the current workspace list; a
-    // project whose directory is another workspace gets its sessions there,
-    // so preflight for an actionable message instead of a silent throw. Only
-    // preflight against a ready list: a pending list misses every session
-    // and would false-positive, so defer to sessions.select's own check.
-    const snapshot = sessions.list.getSnapshot()
-    if (snapshot.phase === 'ready' && snapshot.byId[sessionId as SessionId] === undefined) {
-      throw new Error('会话不在当前工作区列表中，请在侧边栏切换到对应工作区后重试')
-    }
-    sessions.open(sessionId as SessionId)
+    openSessionInShell(ctx, sessions, workspaces, sessionId)
   }
   // Read the workspace default live (when the modal opens), because the
   // workspace list may still be pending at apply time. The last submitted

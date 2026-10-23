@@ -16,6 +16,23 @@ export interface Config {
    * without activity; 0 disables the stale timer (default).
    */
   maxStaleMinutes?: number
+  /**
+   * Auto-archive finished (done) records whose `updatedAt` is at least this
+   * many days old; 0 disables automatic archiving (default 7).
+   */
+  archiveAfterDays?: number
+  /**
+   * Cadence of the automatic archive sweep, in minutes (default 60, minimum
+   * 15 so a background phase can never become a ledger-write amplifier). One
+   * catch-up sweep always runs at startup as well.
+   */
+  archiveSweepMinutes?: number
+  /**
+   * Whether the sweep also archives done task leaves of a still-visible
+   * project (a long-running container's finished leaves would otherwise pile
+   * up forever); default true. The manual archive-task action is unaffected.
+   */
+  archiveDoneTaskLeaves?: boolean
   /** Ledger file override; default is `<dsh home>/kanban/projects.json`. */
   projectsFile?: string
 }
@@ -24,6 +41,9 @@ export const Config: z<Config> = z.object({
   enabled: z.boolean().default(true),
   announceToAgent: z.boolean().default(true),
   maxStaleMinutes: z.number().min(0).default(0),
+  archiveAfterDays: z.number().min(0).default(7),
+  archiveSweepMinutes: z.number().min(15).default(60),
+  archiveDoneTaskLeaves: z.boolean().default(true),
   projectsFile: z.string(),
 })
 

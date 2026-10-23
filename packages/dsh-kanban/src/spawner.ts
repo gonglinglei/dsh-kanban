@@ -460,10 +460,21 @@ export class KanbanSpawner {
     // `write` in the same session from physically destroying the first.
     this.service.ingestPendingAdditions()
     const running = await this.runner.listRunning()
-    for (const project of this.service.snapshot().projects) {
+    // Publishing is an observation of the filesystem, so it walks the RAW
+    // ledger: an archived project must still be able to advertise a request
+    // that arrived after it was archived (otherwise the request would be
+    // materializable but invisible forever — the board would show no badge,
+    // because the view below only contains projects the badge re-surfaces).
+    for (const projectId of this.service.projectIds()) {
       // Publish what is waiting for this project. Assembly field only: no
       // saveState, no revision bump, and a broadcast only when it changed.
-      this.service.refreshPendingAdditions(project.id)
+      this.service.refreshPendingAdditions(projectId)
+    }
+    // Only now is the view authoritative: a project with a live request has
+    // been re-surfaced by the line above, and the driving phases below stay
+    // limited to visible projects (an archived `done` project has nothing to
+    // settle, spawn or observe anyway).
+    for (const project of this.service.snapshot().projects) {
       // Phase 1: settle running sessions (their reports may release
       // dependents). Phase 2: trigger leaves whose dependencies just cleared,
       // so a dependency chain advances within one tick.

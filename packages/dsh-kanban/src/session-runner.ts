@@ -403,8 +403,10 @@ export const DECOMPOSITION_FILE = 'tasks.json'
 
 /**
  * The execution agent's task-additions request file name (inside the
- * per-project artifact dir). Same schema as tasks.json; consumed (renamed
- * to *.consumed.json) by the host when an execute turn settles.
+ * per-project artifact dir). Same schema as tasks.json. The host freezes it
+ * into a staged batch (`*.pending.json`) and later parks it as
+ * `*.consumed.json` / `*.failed.json` / `*.discarded.json`; see
+ * `TaskAdditionsStage` for the full vocabulary.
  */
 export const TASK_ADDITIONS_FILE = 'tasks-additions.json'
 
@@ -444,8 +446,31 @@ export function taskAdditionsPathFor(project: Project): string {
  * - `pending`: ingested, immutable, waiting for a human click.
  * - `consuming`: claimed by a consumer that is materializing it right now.
  * - `consumed`: terminal audit copy of a successfully materialized request.
+ * - `failed`: terminal QUARANTINE of a request that parses but cannot be
+ *   planned (unknown dependency, duplicate title, cycle). It is never retried:
+ *   a poison batch would otherwise fail on every tick / every click forever.
+ *   The file is kept verbatim, so a human can still read it (and restore it by
+ *   renaming it back to `tasks-additions.json`) after fixing the cause.
+ * - `discarded`: terminal HUMAN REJECTION. The human said "do not materialize
+ *   this" (a broken body they do not care about, or a request they no longer
+ *   want), and the file is parked instead of deleted so the decision is
+ *   auditable. Nothing is deleted on the way out.
+ *
+ * The terminal stages (`consumed` / `failed` / `discarded`) are NOT actionable:
+ * they never appear in the badge and are never consumed again.
  */
-export type TaskAdditionsStage = 'fresh' | 'pending' | 'consuming' | 'consumed'
+export type TaskAdditionsStage = 'fresh' | 'pending' | 'consuming' | 'consumed' | 'failed' | 'discarded'
+
+/** The stages a consumer may still materialize (everything that is not terminal). */
+export const ACTIONABLE_TASK_ADDITIONS_STAGES: readonly TaskAdditionsStage[] = ['fresh', 'pending', 'consuming']
+
+/** Whether a classified file can still be materialized (not a terminal audit name). */
+export function isActionableTaskAdditionsStage(stage: TaskAdditionsStage): boolean {
+  return ACTIONABLE_TASK_ADDITIONS_STAGES.includes(stage)
+}
+
+/** The stages a consumer may park a file under once it will never be materialized again. */
+export type TaskAdditionsTerminalStage = 'pending' | 'consuming' | 'consumed' | 'failed' | 'discarded'
 
 /** One recognized request file, as classified from its basename. */
 export interface TaskAdditionsFileRef {
@@ -462,7 +487,7 @@ export interface TaskAdditionsFileRef {
 const TASK_ADDITIONS_STEM = TASK_ADDITIONS_FILE.replace(/\.json$/, '')
 
 /** `tasks-additions.<mtimeMs>[.<ordinal>].<stage>.json`. */
-const TASK_ADDITIONS_STAGED_PATTERN = /^tasks-additions\.(\d+)(?:\.(\d+))?\.(pending|consuming|consumed)\.json$/
+const TASK_ADDITIONS_STAGED_PATTERN = /^tasks-additions\.(\d+)(?:\.(\d+))?\.(pending|consuming|consumed|failed|discarded)\.json$/
 
 /**
  * Classify one directory entry as a task-additions file (or not). This is the
@@ -484,7 +509,7 @@ export function classifyTaskAdditionsFile(name: string): TaskAdditionsFileRef | 
 }
 
 /** The staged file name for one request (the inverse of classifyTaskAdditionsFile). */
-export function taskAdditionsStagedName(mtimeMs: number, stage: 'pending' | 'consuming' | 'consumed', ordinal = 0): string {
+export function taskAdditionsStagedName(mtimeMs: number, stage: TaskAdditionsTerminalStage, ordinal = 0): string {
   const suffix = ordinal === 0 ? '' : `.${ordinal}`
   return `${TASK_ADDITIONS_STEM}.${mtimeMs}${suffix}.${stage}.json`
 }
@@ -501,7 +526,7 @@ export function taskAdditionsStagedName(mtimeMs: number, stage: 'pending' | 'con
 export function uniqueTaskAdditionsName(
   dir: string,
   mtimeMs: number,
-  stage: 'pending' | 'consuming' | 'consumed',
+  stage: TaskAdditionsTerminalStage,
   exists: (path: string) => boolean = existsSync,
 ): string {
   for (let ordinal = 0; ordinal < 1000; ordinal += 1) {
@@ -524,7 +549,7 @@ export function pendingAdditionsFileNames(project: Project): string[] {
   return readdirSync(dir)
     .map(name => classifyTaskAdditionsFile(name))
     .filter((ref): ref is TaskAdditionsFileRef => ref !== undefined)
-    .filter(ref => ref.stage === 'fresh' || ref.stage === 'pending' || ref.stage === 'consuming')
+    .filter(ref => isActionableTaskAdditionsStage(ref.stage))
     .map(ref => ref.name)
     .sort()
 }
@@ -609,7 +634,8 @@ function taskAdditionsLines(project: Project): string[] {
     '2. 只拆分超出当前任务范围的新工作，不要重复拆分你正在执行的任务本身；',
     '3. 写完后再结束你的回合；宿主会读取该请求并在看板上按依赖调度；',
     '   同一会话可多次写入，宿主会逐批接收（不会互相覆盖）；',
-    '   若本回合结束时任务已被结算完成，请求会以「待处理的新增任务请求」出现在看板上，由创建人点击物化。',
+    '   若本回合结束时任务已被结算完成，请求会以「待处理的新增任务请求」出现在看板上，由创建人点击物化；',
+    '   dependsOn 必须指向本项目真实存在的子任务标题，否则该批次无法物化（会被看板隔离并提示创建人）。',
   ]
 }
 

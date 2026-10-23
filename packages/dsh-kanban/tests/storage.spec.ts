@@ -105,6 +105,55 @@ describe('storage', () => {
     expect(loaded.format).toBe(1)
   })
 
+  it('round-trips the archive markers, keeps format 1, and reads a pre-archive ledger', () => {
+    // The archive marker is three optional scalars (same contract as
+    // lastFailure/recovery): the on-disk format stays 1, a round trip
+    // preserves them verbatim, and an old ledger without them loads unchanged
+    // instead of being migrated. Archiving hides a record in the VIEW; storage
+    // never drops it — the file keeps the whole record, marker included.
+    const file = join(dir, 'projects.json')
+    const archivedAt = 1_700_000_000_000
+    const project = sampleProject({ status: 'done', archivedAt, archivedBy: 'system', archiveNote: '自动归档：已完成 7 天（阈值 7 天）' })
+    const task = {
+      id: 't1',
+      projectId: 'p1',
+      titlePath: '已完成的叶子',
+      kind: 'execute' as const,
+      status: 'done' as const,
+      dependencies: [],
+      archivedAt,
+      archivedBy: 'human' as const,
+      archiveNote: '手动归档',
+      version: 2,
+      createdAt: 1,
+      updatedAt: archivedAt,
+      lastActivityAt: archivedAt,
+      history: [],
+    }
+    saveState(file, { format: 1, revision: 9, projects: [project], tasks: [task] })
+
+    const loaded = loadState(file)
+    expect(loaded.projects[0]).toEqual(project)
+    expect(loaded.tasks[0]?.archivedAt).toBe(archivedAt)
+    expect(loaded.tasks[0]?.archivedBy).toBe('human')
+    expect(loaded.tasks[0]?.archiveNote).toBe('手动归档')
+    expect(loaded.format).toBe(1)
+
+    // Still in the ledger file itself (not renamed aside, not moved to a
+    // second archive file): the record is hidden, never deleted.
+    const onDisk = JSON.parse(readFileSync(file, 'utf8')) as { projects: Array<{ archivedAt?: number }>; tasks: Array<{ archivedAt?: number }> }
+    expect(onDisk.projects[0]?.archivedAt).toBe(archivedAt)
+    expect(onDisk.tasks[0]?.archivedAt).toBe(archivedAt)
+
+    // A pre-archive ledger: no marker is invented, nothing is dropped.
+    const legacy = sampleProject()
+    writeFileSync(file, JSON.stringify({ format: 1, revision: 2, projects: [legacy] }), 'utf8')
+    const old = loadState(file)
+    expect(old.projects[0]).toEqual(legacy)
+    expect(old.projects[0]?.archivedAt).toBeUndefined()
+    expect(old.format).toBe(1)
+  })
+
   it('moves a corrupt file aside and starts fresh', () => {
     const file = join(dir, 'projects.json')
     writeFileSync(file, '{not json', 'utf8')

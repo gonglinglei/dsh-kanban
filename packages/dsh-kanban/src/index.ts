@@ -33,6 +33,16 @@ function applyImpl(ctx: Context, rawConfig?: ConfigShape): void {
   const service = new KanbanHostService(resolveProjectsFile(config.projectsFile))
   service.start()
   service.setMaxStaleMinutes(config.maxStaleMinutes ?? 0)
+  // The archive phase is armed exactly like the stale timer: outside
+  // `ctx.effect`, torn down by `service.dispose()`. The position matters —
+  // the startup catch-up runs synchronously here, i.e. BEFORE the spawner's
+  // restart replay and before its first poll, so an already-archived record
+  // never enters either.
+  service.setArchivePolicy({
+    afterDays: config.archiveAfterDays ?? 7,
+    sweepMinutes: config.archiveSweepMinutes ?? 60,
+    doneTaskLeaves: config.archiveDoneTaskLeaves ?? true,
+  })
   const spawner = new KanbanSpawner(service, createKanbanApi(ctx.sessionController))
   // Terminate/delete entry point: the service cancels sessions through the
   // spawner (which also forgets the launch timestamp so no poll settles it).

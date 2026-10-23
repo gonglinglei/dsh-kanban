@@ -13,7 +13,7 @@
  */
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
-import type { KanbanSnapshot, Project, TaskNode } from './protocol.ts'
+import type { Actor, ArchiveMarker, KanbanSnapshot, Project, TaskNode } from './protocol.ts'
 
 /** On-disk shape (revision + projects + task leaves; versioned for future migrations). */
 export interface PersistedState {
@@ -25,6 +25,45 @@ export interface PersistedState {
 
 export function emptyState(): PersistedState {
   return { format: 1, revision: 0, projects: [], tasks: [] }
+}
+
+/** The actors an archive marker may name; anything else is dropped (not the marker). */
+const ARCHIVE_ACTORS: readonly Actor[] = ['human', 'agent', 'system']
+
+/**
+ * Normalize an archive marker IN PLACE and report whether anything was dropped.
+ *
+ * Fail open, never closed: a malformed marker is discarded (the record becomes
+ * visible again and, at worst, is archived once more later) while a corrupt
+ * ledger would take the whole board down. Only structural checks — a negative,
+ * future or inconsistent timestamp is tolerated on purpose.
+ *
+ * The three fields live and die together when `archivedAt` itself is unusable;
+ * `archivedBy` / `archiveNote` are advisory and are dropped alone.
+ */
+function normalizeArchiveMarker<T extends ArchiveMarker>(node: T): boolean {
+  if (node.archivedAt === undefined) {
+    const orphan = node.archivedBy !== undefined || node.archiveNote !== undefined
+    delete node.archivedBy
+    delete node.archiveNote
+    return orphan
+  }
+  if (typeof node.archivedAt !== 'number' || !Number.isFinite(node.archivedAt)) {
+    delete node.archivedAt
+    delete node.archivedBy
+    delete node.archiveNote
+    return true
+  }
+  let dropped = false
+  if (node.archivedBy !== undefined && !ARCHIVE_ACTORS.includes(node.archivedBy)) {
+    delete node.archivedBy
+    dropped = true
+  }
+  if (node.archiveNote !== undefined && typeof node.archiveNote !== 'string') {
+    delete node.archiveNote
+    dropped = true
+  }
+  return dropped
 }
 
 /** Load the ledger; a missing file yields an empty state. */
@@ -43,12 +82,31 @@ export function loadState(file: string): PersistedState {
     }
     // tasks is additive (pre-decomposition ledgers have none).
     // Normalize: persisted tasks may be missing array fields from older versions.
-    const tasks = (parsed.tasks ?? []).map(t => ({
-      ...t,
-      dependencies: Array.isArray(t.dependencies) ? t.dependencies : [],
-      history: Array.isArray(t.history) ? t.history : [],
-    }))
-    return { format: 1, revision: parsed.revision, projects: parsed.projects, tasks }
+    // Both maps keep spreading the unknown keys (`{...t}`, projects passthrough):
+    // that is what makes a downgrade lossless — an older host's loader preserves
+    // the archive fields it does not understand instead of wiping them.
+    let droppedMarkers = 0
+    const projects = (parsed.projects as Project[]).map(project => {
+      if (normalizeArchiveMarker(project)) droppedMarkers += 1
+      return project
+    })
+    const tasks = (parsed.tasks ?? []).map(t => {
+      const task: TaskNode = {
+        ...t,
+        dependencies: Array.isArray(t.dependencies) ? t.dependencies : [],
+        history: Array.isArray(t.history) ? t.history : [],
+      }
+      if (normalizeArchiveMarker(task)) droppedMarkers += 1
+      return task
+    })
+    if (droppedMarkers > 0) {
+      // One line per load, never per record: this is a self-healing read.
+      console.warn(`[dsh-kanban] dropped ${droppedMarkers} invalid archive marker(s) from ${file}`)
+    }
+    // Normalization stays in memory: boot never rewrites the ledger (a dropped
+    // marker disappears with the next real mutation, and `revision` only moves
+    // on a mutation).
+    return { format: 1, revision: parsed.revision, projects, tasks }
   } catch (error) {
     const aside = `${file}.corrupt-${Date.now()}`
     renameSync(file, aside)

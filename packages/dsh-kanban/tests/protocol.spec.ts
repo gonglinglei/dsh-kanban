@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseActionEnvelope } from '../src/protocol.ts'
+import { CAPABILITY_TASK_ARCHIVE, HOST_CAPABILITIES, parseActionEnvelope } from '../src/protocol.ts'
 
 function envelope(action: unknown): string {
   return JSON.stringify({ requestId: 'req-1', action })
@@ -127,5 +127,109 @@ describe('parseActionEnvelope recover-task', () => {
     // not know recover-task answers 400 invalid-action instead of corrupting
     // the ledger, which is exactly why the button is capability-gated.
     expect(parseActionEnvelope(envelope({ kind: 'recover-task-future', projectId: 'p1', taskId: 't1' }))).toBeUndefined()
+  })
+})
+
+describe('parseActionEnvelope archive-project / unarchive-project', () => {
+  const projectKinds = ['archive-project', 'unarchive-project'] as const
+
+  it('parses the minimal body and omits an absent note', () => {
+    for (const kind of projectKinds) {
+      expect(parseActionEnvelope(envelope({ kind, projectId: 'p1' }))?.action)
+        .toEqual({ kind, projectId: 'p1' })
+    }
+  })
+
+  it('keeps an explicit note (including the empty string) and drops redundant fields', () => {
+    for (const kind of projectKinds) {
+      expect(parseActionEnvelope(envelope({ kind, projectId: 'p1', note: '手动归档', extra: 1 }))?.action)
+        .toEqual({ kind, projectId: 'p1', note: '手动归档' })
+      // '' is a legal string: the archive cases deliberately match the strictness
+      // of terminate-task / discard-additions rather than inventing a new rule.
+      expect(parseActionEnvelope(envelope({ kind, projectId: 'p1', note: '' }))?.action)
+        .toEqual({ kind, projectId: 'p1', note: '' })
+    }
+  })
+
+  it('rejects a missing / blank / non-string projectId', () => {
+    for (const kind of projectKinds) {
+      expect(parseActionEnvelope(envelope({ kind }))).toBeUndefined()
+      expect(parseActionEnvelope(envelope({ kind, projectId: '' }))).toBeUndefined()
+      expect(parseActionEnvelope(envelope({ kind, projectId: 7 }))).toBeUndefined()
+      expect(parseActionEnvelope(envelope({ kind, projectId: { id: 'p1' } }))).toBeUndefined()
+    }
+  })
+
+  it('rejects a note that is present but not a string', () => {
+    for (const kind of projectKinds) {
+      expect(parseActionEnvelope(envelope({ kind, projectId: 'p1', note: 42 }))).toBeUndefined()
+      expect(parseActionEnvelope(envelope({ kind, projectId: 'p1', note: null }))).toBeUndefined()
+      expect(parseActionEnvelope(envelope({ kind, projectId: 'p1', note: {} }))).toBeUndefined()
+    }
+  })
+
+  it('never echoes snapshot-side fields back into the action', () => {
+    const parsed = parseActionEnvelope(envelope({ kind: 'archive-project', projectId: 'p1', archivedAt: 1, history: [] }))
+    expect(Object.keys(parsed!.action).sort()).toEqual(['kind', 'projectId'])
+  })
+})
+
+describe('parseActionEnvelope archive-task / unarchive-task', () => {
+  const taskKinds = ['archive-task', 'unarchive-task'] as const
+
+  it('parses the minimal body and keeps an optional note', () => {
+    for (const kind of taskKinds) {
+      expect(parseActionEnvelope(envelope({ kind, projectId: 'p1', taskId: 't1' }))?.action)
+        .toEqual({ kind, projectId: 'p1', taskId: 't1' })
+      expect(parseActionEnvelope(envelope({ kind, projectId: 'p1', taskId: 't1', note: '累积的已完成叶子' }))?.action)
+        .toEqual({ kind, projectId: 'p1', taskId: 't1', note: '累积的已完成叶子' })
+    }
+  })
+
+  it('rejects a missing / blank / non-string projectId or taskId', () => {
+    for (const kind of taskKinds) {
+      expect(parseActionEnvelope(envelope({ kind, taskId: 't1' }))).toBeUndefined()
+      expect(parseActionEnvelope(envelope({ kind, projectId: '', taskId: 't1' }))).toBeUndefined()
+      expect(parseActionEnvelope(envelope({ kind, projectId: 'p1' }))).toBeUndefined()
+      expect(parseActionEnvelope(envelope({ kind, projectId: 'p1', taskId: '' }))).toBeUndefined()
+      expect(parseActionEnvelope(envelope({ kind, projectId: 'p1', taskId: 42 }))).toBeUndefined()
+    }
+  })
+
+  it('rejects a note that is present but not a string', () => {
+    for (const kind of taskKinds) {
+      expect(parseActionEnvelope(envelope({ kind, projectId: 'p1', taskId: 't1', note: 42 }))).toBeUndefined()
+      expect(parseActionEnvelope(envelope({ kind, projectId: 'p1', taskId: 't1', note: null }))).toBeUndefined()
+    }
+  })
+})
+
+describe('task-archive capability handshake', () => {
+  it('appends the token after the frozen pre-existing ordering', () => {
+    // The first six tokens are load-bearing for older clients and must never
+    // move; new capabilities only ever append.
+    expect(HOST_CAPABILITIES.slice(0, 6)).toEqual([
+      'long-running-projects',
+      'parent-workspace-inheritance',
+      'task-terminate-delete',
+      'task-recovery',
+      'late-task-additions',
+      'additions-discard',
+    ])
+    expect(HOST_CAPABILITIES.at(-1)).toBe(CAPABILITY_TASK_ARCHIVE)
+    expect(CAPABILITY_TASK_ARCHIVE).toBe('task-archive')
+    expect(HOST_CAPABILITIES).toHaveLength(7)
+  })
+})
+
+describe('parseActionEnvelope archive misspellings', () => {
+  it('keeps the default branch: a near-miss kind is still rejected', () => {
+    // Guard against a copy-paste typo in the hand-written switch: an unknown
+    // kind must fall through to `undefined` (route answers 400 invalid-action)
+    // rather than being silently accepted.
+    expect(parseActionEnvelope(envelope({ kind: 'archive-projectt', projectId: 'p1' }))).toBeUndefined()
+    expect(parseActionEnvelope(envelope({ kind: 'archive', projectId: 'p1' }))).toBeUndefined()
+    expect(parseActionEnvelope(envelope({ kind: 'archivetask', projectId: 'p1', taskId: 't1' }))).toBeUndefined()
+    expect(parseActionEnvelope(envelope({ kind: 'unarchive', projectId: 'p1' }))).toBeUndefined()
   })
 })

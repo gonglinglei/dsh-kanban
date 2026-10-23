@@ -12,14 +12,15 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs'
 import { isAbsolute, join, resolve, sep } from 'node:path'
 import { DecompositionError, flattenDecomposition, loadDecomposition, parseDecomposition, type TaskLeaf } from './decomposition.ts'
-import { HOST_CAPABILITIES, PENDING_ITEMS_MAX } from './protocol.ts'
+import { ARCHIVE_NOTE_MAX, HOST_CAPABILITIES, MS_PER_DAY, PENDING_ITEMS_MAX, PENDING_PROBLEMS_MAX, archivedProjectIds, isArchived, isLeafHidden } from './protocol.ts'
 import type {
-  Actor, FailureDiagnostic, HistoryEntry, KanbanEventPayload, KanbanSnapshot, PendingAddition, PendingAdditionItem, Project,
-  ProjectStatus, RecoveryStrategy, TaskKind, TaskNode,
+  Actor, ArchiveEntry, FailureDiagnostic, KanbanEventPayload, KanbanSnapshot, PendingAddition, PendingAdditionItem,
+  PendingAdditionProblem, Project, ProjectStatus, RecoveryStrategy, TaskKind, TaskNode,
 } from './protocol.ts'
 import {
-  DECOMPOSITION_FILE, classifyTaskAdditionsFile, decompositionPathFor, failureDiagnostic, pendingAdditionsFileNames,
-  projectDir, taskArtifactPath, uniqueTaskAdditionsName, type TaskAdditionsFileRef,
+  DECOMPOSITION_FILE, TASK_ADDITIONS_FILE, classifyTaskAdditionsFile, decompositionPathFor, failureDiagnostic,
+  isActionableTaskAdditionsStage, pendingAdditionsFileNames, projectDir, taskArtifactPath, uniqueTaskAdditionsName,
+  type TaskAdditionsFileRef, type TaskAdditionsTerminalStage,
 } from './session-runner.ts'
 import { assertTransitionAllowed, TransitionError } from './state-machine.ts'
 import { emptyState, loadState, saveState, type PersistedState } from './storage.ts'
@@ -75,6 +76,10 @@ interface AdditionsRead {
  * entry. `state: 'malformed'` is deliberately a shaped result, never
  * `undefined`: a node that already left the observation window has no code
  * path left that would throw, so a parse failure must be visible HERE.
+ *
+ * The parse failures are carried as a LIST (`malformed`) instead of only the
+ * primary file's `error`: one broken batch must neither hide nor be hidden by
+ * the healthy batches sitting next to it.
  */
 export interface AdditionsProbe {
   state: 'ready' | 'malformed'
@@ -82,12 +87,14 @@ export interface AdditionsProbe {
   file: string
   /** The oldest aggregated request's mtime (epoch millis). */
   at: number
-  /** How many request files this probe aggregated. */
+  /** How many request files this probe aggregated (broken ones included). */
   batches: number
   /** How many leaves those files would materialize in total. */
   count: number
   /** Bounded preview of the leaves (at most PENDING_ITEMS_MAX). */
   items: PendingAdditionItem[]
+  /** The aggregated request files that cannot be parsed (possibly empty). */
+  malformed: PendingAdditionProblem[]
   /** Parse/read failure of the primary file (present only when malformed). */
   error?: string
 }
@@ -106,15 +113,56 @@ interface PlannedAdditions {
   skipped: string[]
 }
 
+/**
+ * A batch that PARSES but cannot be planned (unknown dependency, duplicate
+ * title / cycle). It is quarantined instead of retried forever.
+ */
+interface UnplannableAdditionsBatch {
+  file: AdditionsFile
+  error: string
+}
+
+/** A batch whose body cannot even be parsed. The host leaves it in place for diagnosis. */
+interface BrokenAdditionsBatch {
+  file: AdditionsFile
+  error: string
+}
+
+/** The pure outcome of planning every actionable batch of one project. */
+interface PlannedHumanAdditions {
+  batches: PlannedAdditionsBatch[]
+  pending: TaskNode[]
+  skipped: string[]
+  broken: BrokenAdditionsBatch[]
+  unplannable: UnplannableAdditionsBatch[]
+}
+
 /** What `materializePendingAdditions` did, for the action response and the tests. */
 export interface MaterializeAdditionsResult {
   created: TaskNode[]
   skipped: string[]
   /** The request files that were consumed (basenames, after the audit rename). */
   consumed: string[]
+  /** The requests that parsed but could not be planned; quarantined as `*.failed.json`. */
+  failed: PendingAdditionProblem[]
+  /** The requests that could not even be parsed; left in place for diagnosis. */
+  broken: PendingAdditionProblem[]
   /** Whether the project had to be re-opened (done / blocked → executing). */
   reopened: boolean
   project: Project
+}
+
+/** What `discardPendingAdditions` did: the requests a human threw away. */
+export interface DiscardAdditionsResult {
+  /** The parked request files (basenames, after the `.discarded` rename). */
+  discarded: DiscardedAdditionsFile[]
+  project: Project
+}
+
+/** One request file a human threw away: its terminal basename plus the source mtime. */
+export interface DiscardedAdditionsFile {
+  file: string
+  at: number
 }
 
 export interface CreateProjectInput {
@@ -158,6 +206,18 @@ export class KanbanHostService {
   private staleTimer: NodeJS.Timeout | undefined
   private maxStaleMinutes = 0
   /**
+   * Automatic archiving phase. `archiveAfterDays <= 0` disables it and the
+   * timer does not exist at all; like the stale timer it is armed outside
+   * `ctx.effect` and torn down by `dispose()`.
+   */
+  private archiveTimer: NodeJS.Timeout | undefined
+  private archiveAfterDays = 0
+  private archiveSweepMinutes = 0
+  private archiveDoneTaskLeaves = true
+  /** Whether the ledger is loaded, and whether the one startup catch-up already ran. */
+  private ledgerLoaded = false
+  private archiveCaughtUp = false
+  /**
    * The published pending-additions entries, keyed by project. Assembly-only:
    * refreshed by the spawner's scan phase, NEVER written to the ledger (the
    * same contract as `capabilities`), so an unchanged probe on a 5-second
@@ -179,12 +239,20 @@ export class KanbanHostService {
   /** Load the ledger from disk (synchronous: boot must see the persisted board). */
   start(): void {
     this.state = loadState(this.file)
+    this.ledgerLoaded = true
+    // A periodic phase cannot rely on the host having been online when a record
+    // came due, so boot catches up once. One sweep is enough no matter how long
+    // the host was down: eligibility is a pure function of `updatedAt` and
+    // `now`, never of "how many ticks were missed".
+    this.maybeArchiveCatchUp()
   }
 
-  /** Tear down the stale timer and listeners. */
+  /** Tear down the stale/archive timers and listeners. */
   dispose(): void {
     if (this.staleTimer !== undefined) clearInterval(this.staleTimer)
     this.staleTimer = undefined
+    if (this.archiveTimer !== undefined) clearInterval(this.archiveTimer)
+    this.archiveTimer = undefined
     this.listeners.clear()
   }
 
@@ -197,6 +265,60 @@ export class KanbanHostService {
     }
     if (minutes <= 0) return
     this.staleTimer = setInterval(() => this.checkStale(), STALE_TICK_SECONDS * 1000)
+  }
+
+  /**
+   * Arm the automatic archive phase and, when the ledger is already loaded,
+   * run the startup catch-up immediately.
+   *
+   * The shape deliberately mirrors `setMaxStaleMinutes` (disarm first, non-
+   * positive values disarm), except that the sweep cadence IS the window
+   * precision: the product delay is measured in days, so a fixed tick plus a
+   * threshold would buy nothing and cost one more piece of state.
+   */
+  setArchivePolicy(policy: { afterDays: number; sweepMinutes: number; doneTaskLeaves?: boolean }): void {
+    this.archiveAfterDays = policy.afterDays
+    this.archiveSweepMinutes = policy.sweepMinutes
+    this.archiveDoneTaskLeaves = policy.doneTaskLeaves ?? true
+    this.armArchiveTimer()
+    this.maybeArchiveCatchUp()
+  }
+
+  /** (Re)arm the sweep timer; a disabled policy leaves no timer behind. */
+  private armArchiveTimer(): void {
+    if (this.archiveTimer !== undefined) {
+      clearInterval(this.archiveTimer)
+      this.archiveTimer = undefined
+    }
+    // `setInterval(fn, 0)` would spin the event loop, so a non-positive cadence
+    // must disarm explicitly (the config schema's min(15) is not the only
+    // caller: tests and programmatic callers reach this directly).
+    if (this.archiveAfterDays <= 0 || this.archiveSweepMinutes <= 0) return
+    this.archiveTimer = setInterval(() => this.runArchiveSweep(Date.now()), this.archiveSweepMinutes * 60_000)
+  }
+
+  /**
+   * The startup catch-up, callable from either order of `start()` /
+   * `setArchivePolicy()`: it runs once, as soon as both the ledger and a
+   * positive window are known. It must complete BEFORE the spawner's restart
+   * replay loop, which is why it runs synchronously here.
+   */
+  private maybeArchiveCatchUp(): void {
+    if (!this.ledgerLoaded || this.archiveCaughtUp) return
+    if (this.archiveAfterDays <= 0) return
+    this.archiveCaughtUp = true
+    // Boot must never fail because of a background phase: the catch-up shares
+    // the timer's "log, never throw" wrapper.
+    this.runArchiveSweep(Date.now())
+  }
+
+  /** Last line of defence for the timer: an exception must never escape into the event loop. */
+  private runArchiveSweep(now: number): void {
+    try {
+      this.archiveSweep(now)
+    } catch (error) {
+      console.error('[dsh-kanban] archive sweep failed', error)
+    }
   }
 
   /** The spawner wires its phase hooks here. */
@@ -268,6 +390,15 @@ export class KanbanHostService {
     if (task.status === 'executing') this.onEnterTaskExecuting(task)
   }
 
+  /**
+   * The board VIEW over the ledger: archived records are filtered out and the
+   * archive is reported as two counts.
+   *
+   * Read discipline: every eligibility judgement inside the host reads the RAW
+   * ledger (`this.state`); only this view (and the on-demand archive read)
+   * knows about archiving. Turning the view into a business input is exactly
+   * how an archived project would silently stop being observed.
+   */
   snapshot(): KanbanSnapshot {
     // Capabilities are assembled fresh from the running build (never read
     // from the ledger), so a restarted host on new code immediately
@@ -275,16 +406,57 @@ export class KanbanHostService {
     // `pendingAdditions` follows the same rule: it is a view over files on
     // disk, rebuilt by the spawner's scan phase, and it must never leak a
     // badge for a project that no longer exists.
+    //
+    // Hygiene stays keyed on the RAW ledger on purpose: an archived project
+    // keeps its published entry, otherwise the request that makes it visible
+    // again (see `hiddenProjects` below) could never be re-published.
     const live = new Set(this.state.projects.map(project => project.id))
     for (const projectId of [...this.pendingAdditions.keys()]) {
       if (!live.has(projectId)) this.pendingAdditions.delete(projectId)
     }
+
+    const archivedProjects = archivedProjectIds(this.state.projects)
+    // A live task-additions request outranks the archive: the request has to
+    // stay visible and actionable, and it is published by the spawner's poll
+    // (which reads the raw ledger). Re-surfacing brings the project AND its
+    // leaves back for as long as the request is pending — the ledger marker is
+    // untouched, so the project returns to the archive once the request is gone.
+    const hiddenProjects = new Set(archivedProjects)
+    for (const projectId of archivedProjects) {
+      if (this.pendingAdditions.has(projectId)) hiddenProjects.delete(projectId)
+    }
+
+    const projects: Project[] = []
+    for (const project of this.state.projects) {
+      if (hiddenProjects.has(project.id)) continue
+      projects.push(project)
+    }
+    const visibleProjects = new Set(projects.map(project => project.id))
+
+    const tasks: TaskNode[] = []
+    let archivedTasks = 0
+    for (const task of this.state.tasks) {
+      if (isArchived(task)) {
+        // A leaf only counts as its own archive entry while its project is
+        // visible; otherwise the project entry already implies it (the same
+        // rule the archive read and `archivedCounts` use).
+        if (!archivedProjects.has(task.projectId)) archivedTasks += 1
+        continue
+      }
+      if (isLeafHidden(task, hiddenProjects)) continue
+      if (!visibleProjects.has(task.projectId)) continue
+      tasks.push(task)
+    }
+
     return {
       revision: this.state.revision,
-      projects: this.state.projects,
-      tasks: this.state.tasks,
+      projects,
+      tasks,
       capabilities: [...HOST_CAPABILITIES],
-      pendingAdditions: [...this.pendingAdditions.values()],
+      // Referential integrity: never publish a badge whose project is not in
+      // this snapshot (a dangling badge would have nothing to open).
+      pendingAdditions: [...this.pendingAdditions.values()].filter(entry => visibleProjects.has(entry.projectId)),
+      archivedCounts: { projects: archivedProjects.size, tasks: archivedTasks },
     }
   }
 
@@ -305,6 +477,18 @@ export class KanbanHostService {
 
   getTask(taskId: string): TaskNode | undefined {
     return this.state.tasks.find(task => task.id === taskId)
+  }
+
+  /**
+   * Every project id in the RAW ledger, archived ones included.
+   *
+   * The spawner publishes pending requests through this list instead of the
+   * snapshot: publishing is an observation of the filesystem, not a decision
+   * about what the board shows, and an archived project must still be able to
+   * advertise a request that arrived after it was archived.
+   */
+  projectIds(): string[] {
+    return this.state.projects.map(project => project.id)
   }
 
   /** All task leaves of one project. */
@@ -783,32 +967,66 @@ export class KanbanHostService {
     }
   }
 
-  /** Record one transition (or creation): bump version, push the history entry, persist, broadcast. */
-  private commit(project: Project, actor: Actor, from: ProjectStatus, to: ProjectStatus, note?: string): void {
+  /**
+   * Record one metadata/status commit — the single writer of `status`,
+   * `version`, `updatedAt`, `lastActivityAt` and the history log.
+   *
+   * Batch semantics: every node in one call shares one `now`, and the batch is
+   * persisted and broadcast ONCE (revision +1). That is what lets a sweep
+   * archive N records without rewriting the whole ledger N times. An empty
+   * batch is a complete no-op: a caller that found nothing to do must not
+   * touch the disk.
+   */
+  private applyBatch(entries: readonly BatchEntry[]): void {
+    if (entries.length === 0) return
     const now = Date.now()
-    project.status = to
-    project.updatedAt = now
-    project.lastActivityAt = now
-    project.version += 1
-    const entry: HistoryEntry = { at: now, actor, from, to, ...(note === undefined ? {} : { note }) }
-    project.history.push(entry)
+    for (const entry of entries) {
+      const node = entry.node
+      node.status = entry.to
+      // The recovery marker only exists while a leaf is active; clearing it on
+      // every commit that lands the leaf elsewhere keeps that rule in one place.
+      if (isTaskNode(node) && node.recovery !== undefined && entry.to !== 'designing' && entry.to !== 'executing') {
+        delete node.recovery
+      }
+      node.updatedAt = now
+      node.lastActivityAt = now
+      node.version += 1
+      const entryNote = entry.note
+      node.history.push({ at: now, actor: entry.actor, from: entry.from, to: entry.to, ...(entryNote === undefined ? {} : { note: entryNote }) })
+      // Chokepoint: an archived record must be `done`. Any commit that moves it
+      // anywhere else drops the marker for free — including the materialize
+      // path, which re-opens a project as `executing` and therefore restores it
+      // to the board without a single explicit unarchive call.
+      this.syncArchiveMarker(node, entry.to)
+    }
     this.mutate()
+  }
+
+  /** Record one project transition (or creation). */
+  private commit(project: Project, actor: Actor, from: ProjectStatus, to: ProjectStatus, note?: string): void {
+    this.applyBatch([{ node: project, actor, from, to, note }])
   }
 
   /** Same as commit, for task leaves. */
   private taskCommit(task: TaskNode, actor: Actor, from: ProjectStatus, to: ProjectStatus, note?: string): void {
-    const now = Date.now()
-    task.status = to
-    // Single point for the recovery marker's lifetime: it only exists while
-    // the leaf is active, so any commit that lands it on done / blocked /
-    // awaiting-review clears it — no per-call-site cleanup to forget.
-    if (task.recovery !== undefined && to !== 'designing' && to !== 'executing') task.recovery = undefined
-    task.updatedAt = now
-    task.lastActivityAt = now
-    task.version += 1
-    const entry: HistoryEntry = { at: now, actor, from, to, ...(note === undefined ? {} : { note }) }
-    task.history.push(entry)
-    this.mutate()
+    this.applyBatch([{ node: task, actor, from, to, note }])
+  }
+
+  /**
+   * Archive-marker lifetime, maintained in exactly this one place: the marker
+   * is only meaningful while the record is `done`, so any write that lands it
+   * on another status clears it. Without this, a human `transition` could
+   * leave a hidden-but-running project that nobody can see.
+   *
+   * Status-preserving observation writes never come through here, which is why
+   * they cannot accidentally un-archive a record.
+   */
+  private syncArchiveMarker(node: Project | TaskNode, to: ProjectStatus): void {
+    if (to === 'done') return
+    if (node.archivedAt === undefined) return
+    delete node.archivedAt
+    delete node.archivedBy
+    delete node.archiveNote
   }
 
   /** Read the decomposition file the design agent wrote; undefined when not decomposed. */
@@ -915,6 +1133,10 @@ export class KanbanHostService {
       project.lastActivityAt = now
       project.version += 1
       project.history.push({ at: now, actor, from: project.status, to: project.status, note: options.projectNote })
+      // Defensive, not load-bearing: materialization never moves a project's
+      // status (planning already did), so this only keeps the "archived implies
+      // done" rule true even if a future caller passes a non-done project.
+      this.syncArchiveMarker(project, project.status)
     }
     this.mutate()
     for (const task of pending) {
@@ -965,9 +1187,14 @@ export class KanbanHostService {
     })
   }
 
-  /** The files that still have to be materialized (fresh / pending / consuming). */
+  /**
+   * The files that still have to be materialized (fresh / pending / consuming).
+   * The terminal stages (`consumed` / `failed` / `discarded`) are audit names:
+   * they are excluded POSITIVELY, so adding a new terminal stage can never
+   * accidentally re-arm an audit file as a live request.
+   */
   private actionableAdditions(project: Project): AdditionsFile[] {
-    return this.listAdditionsFiles(project).filter(file => file.ref.stage !== 'consumed')
+    return this.listAdditionsFiles(project).filter(file => isActionableTaskAdditionsStage(file.ref.stage))
   }
 
   /**
@@ -1010,32 +1237,49 @@ export class KanbanHostService {
     const files = this.actionableAdditions(project).filter(file => this.isAdditionsSettled(file))
     if (files.length === 0) return undefined
     const primary = files[0]!
-    const primaryRead = this.readAdditions(primary.path)
-    if (primaryRead.error !== undefined) {
-      // Shaped failure, not `undefined`: a node that already left the
-      // observation window has no other code path that could ever throw.
-      return {
-        state: 'malformed',
-        file: primary.ref.name,
-        at: primary.mtimeMs,
-        batches: files.length,
-        count: 0,
-        items: [],
-        error: primaryRead.error,
-      }
-    }
+    const malformed: PendingAdditionProblem[] = []
     const items: PendingAdditionItem[] = []
     let count = 0
     for (const file of files) {
-      const read = file === primary ? primaryRead : this.readAdditions(file.path)
-      if (read.error !== undefined) continue
+      const read = this.readAdditions(file.path)
+      if (read.error !== undefined) {
+        malformed.push({ file: file.ref.name, at: file.mtimeMs, error: read.error })
+        continue
+      }
+      // A healthy batch is NEVER hidden behind a broken one: the count, the
+      // preview and (below) the consume path all aggregate the parseable
+      // batches, so "2 requests, one broken" reads exactly like that.
       count += read.leaves.length
       for (const leaf of read.leaves) {
         if (items.length >= PENDING_ITEMS_MAX) break
         items.push({ titlePath: boundText(leaf.titlePath, PENDING_TITLE_MAX), kind: leaf.kind })
       }
     }
-    return { state: 'ready', file: primary.ref.name, at: primary.mtimeMs, batches: files.length, count, items }
+    const bounded = malformed.slice(0, PENDING_PROBLEMS_MAX)
+    if (count === 0 && malformed.length > 0) {
+      // Shaped failure, not `undefined`: a node that already left the
+      // observation window has no other code path that could ever throw.
+      const first = malformed[0]!
+      return {
+        state: 'malformed',
+        file: first.file,
+        at: first.at,
+        batches: files.length,
+        count: 0,
+        items: [],
+        malformed: bounded,
+        error: first.error,
+      }
+    }
+    return {
+      state: 'ready',
+      file: primary.ref.name,
+      at: primary.mtimeMs,
+      batches: files.length,
+      count,
+      items,
+      malformed: bounded,
+    }
   }
 
   /**
@@ -1080,7 +1324,10 @@ export class KanbanHostService {
       this.pendingAdditions.delete(projectId)
     } else {
       this.pendingAdditions.set(projectId, next)
-      if (next.state === 'malformed') this.noteMalformedOnce(next)
+      // Every broken file version is reported once — including a broken batch
+      // sitting next to healthy ones (which stays `ready`, so the old
+      // `state === 'malformed'` test would have missed it).
+      for (const problem of next.malformed ?? []) this.noteMalformedOnce(next.projectId, problem)
     }
     // Push only — never persist: this is a view over files, not ledger state.
     this.broadcast()
@@ -1093,11 +1340,11 @@ export class KanbanHostService {
    * new version, so a NEW breakage is reported again, while an unrepaired file
    * never becomes a per-tick ledger writer.
    */
-  private noteMalformedOnce(entry: PendingAddition): void {
-    const key = `${entry.projectId}:${entry.file}:${entry.at}`
+  private noteMalformedOnce(projectId: string, problem: PendingAdditionProblem): void {
+    const key = `${projectId}:${problem.file}:${problem.at}`
     if (this.malformedNoted.has(key)) return
     this.malformedNoted.add(key)
-    this.noteAnomaly(entry.projectId, `待处理的新增任务请求无法解析（${entry.file}）：${entry.error ?? 'unknown error'}`)
+    this.noteAnomaly(projectId, `待处理的新增任务请求无法解析（${problem.file}）：${problem.error}`)
   }
 
   /**
@@ -1144,9 +1391,11 @@ export class KanbanHostService {
   }
 
   /**
-   * Pure planning of a consumption over the first `limit` actionable batches,
-   * freshest intent first. Nothing is claimed and nothing is committed here.
-   * A malformed body still throws DecompositionError (loud, file preserved).
+   * Pure planning of the SETTLE path's consumption over the first `limit`
+   * actionable batches, freshest intent first. Nothing is claimed and nothing
+   * is committed here. A malformed body still throws DecompositionError (loud,
+   * file preserved): the settle path is the agent's own write and a broken one
+   * must fail its node loudly rather than be silently parked.
    *
    * Deliberately NOT gated on the freshness-settling rule: a consumer that has
    * already decided to read a request must keep the exact semantics the settle
@@ -1174,6 +1423,44 @@ export class KanbanHostService {
     return { batches, pending, skipped }
   }
 
+  /**
+   * Pure planning of the HUMAN click's consumption, which must never dead-end:
+   * a batch the planner rejects is CLASSIFIED instead of thrown, so the exit
+   * can be decided per batch (quarantine it, keep going with the rest) rather
+   * than losing the whole click to the first poison request.
+   *
+   * Three outcomes per batch:
+   * - planned: it will be materialized;
+   * - broken: the body does not even parse — left exactly where it is, because
+   *   the file IS the evidence (the human fixes or discards it);
+   * - unplannable: parses, but the graph rejects it (unknown dependency, cycle)
+   *   — a poison batch that would fail again on every retry, so it is isolated.
+   */
+  private planHumanAdditions(project: Project, files: readonly AdditionsFile[]): PlannedHumanAdditions {
+    const existing = this.projectTasks(project.id)
+    const batches: PlannedAdditionsBatch[] = []
+    const pending: TaskNode[] = []
+    const skipped: string[] = []
+    const broken: BrokenAdditionsBatch[] = []
+    const unplannable: UnplannableAdditionsBatch[] = []
+    for (const file of files) {
+      const read = this.readAdditions(file.path)
+      if (read.error !== undefined) {
+        broken.push({ file, error: read.error })
+        continue
+      }
+      try {
+        const planned = this.planTaskNodes(project, read.leaves, [...existing, ...pending], 'skip')
+        batches.push({ file, pending: planned.pending, skipped: planned.skipped })
+        pending.push(...planned.pending)
+        skipped.push(...planned.skipped)
+      } catch (error) {
+        unplannable.push({ file, error: boundText(error instanceof Error ? error.message : String(error), PENDING_ERROR_MAX) })
+      }
+    }
+    return { batches, pending, skipped, broken, unplannable }
+  }
+
   /** Claim one planned batch: the atomic rename that makes a replay idempotent. */
   private claimAdditionsBatch(project: Project, file: AdditionsFile): string {
     const dir = projectDir(project)
@@ -1182,12 +1469,38 @@ export class KanbanHostService {
     return target
   }
 
+  /**
+   * Park one file in a terminal stage (never overwriting an earlier audit).
+   * Shared by `consumed` / `failed` / `discarded`: all three are the same
+   * mechanical move, only the vocabulary differs.
+   */
+  private keepAdditionsBatch(project: Project, path: string, mtimeMs: number, stage: TaskAdditionsTerminalStage): string {
+    const dir = projectDir(project)
+    const name = uniqueTaskAdditionsName(dir, mtimeMs, stage)
+    renameSync(path, join(dir, name))
+    return name
+  }
+
   /** Park a claimed batch in its terminal audit name (never overwriting an earlier audit). */
   private keepAdditionsBatchConsumed(project: Project, claimedPath: string, mtimeMs: number): string {
-    const dir = projectDir(project)
-    const name = uniqueTaskAdditionsName(dir, mtimeMs, 'consumed')
-    renameSync(claimedPath, join(dir, name))
-    return name
+    return this.keepAdditionsBatch(project, claimedPath, mtimeMs, 'consumed')
+  }
+
+  /** Isolate an unplannable batch: the terminal stage that stops the retry loop. */
+  private quarantineAdditionsBatch(project: Project, file: AdditionsFile, cause: string): string | undefined {
+    try {
+      const claimed = this.claimAdditionsBatch(project, file)
+      const name = this.keepAdditionsBatch(project, claimed, file.mtimeMs, 'failed')
+      this.noteAnomaly(
+        project.id,
+        `新增任务请求无法物化（unplannable）：${cause}；文件已隔离为 ${name}。` +
+        `如需重试，请修好原因后把它改回 ${TASK_ADDITIONS_FILE}`,
+      )
+      return name
+    } catch {
+      // A concurrent consumer claimed it first; the next tick sees the truth.
+      return undefined
+    }
   }
 
   /**
@@ -1233,11 +1546,21 @@ export class KanbanHostService {
   /**
    * Human entry: materialize the project's pending requests NOW.
    *
-   * The order is deliberate: plan (pure — may throw with zero side effects) →
-   * claim (filesystem receipt) → re-open the project → commit every leaf in
-   * one batch → audit rename → audit note. Any error path leaves the ledger
-   * untouched and the request files in place, so a double click and a
-   * malformed body both stay explainable instead of destructive.
+   * The order is deliberate: plan (pure) → claim (filesystem receipt) →
+   * re-open the project → commit every leaf in one batch → audit rename →
+   * audit note. Any error path leaves the ledger untouched, so a double click
+   * and a malformed body both stay explainable instead of destructive.
+   *
+   * Unlike the settle path, ONE poison request never cancels the click:
+   * - a body that does not parse is left exactly where it is (the human fixes
+   *   it or discards it — silently renaming it away would hide the evidence);
+   * - a batch that parses but cannot be planned is quarantined into
+   *   `*.failed.json` with its own anomaly note, so it stops failing forever
+   *   without ever being deleted.
+   * Both outcomes are reported in the result AND in the audit line: nothing
+   * leaves the actionable set silently. When EVERY actionable batch is
+   * unplannable the project is not re-opened (nothing was materialized) and the
+   * call throws with an explanatory receipt.
    */
   materializePendingAdditions(projectId: string, note?: string): MaterializeAdditionsResult {
     const project = this.requireProject(projectId)
@@ -1249,27 +1572,128 @@ export class KanbanHostService {
       throw new TransitionError(`project ${projectId} has no pending task-additions request`)
     }
     if (probe.state === 'malformed') {
-      throw new TransitionError(`tasks-additions.json is malformed: ${probe.error ?? 'unknown error'}`)
+      throw new TransitionError(
+        `tasks-additions.json is malformed: ${probe.error ?? 'unknown error'}；` +
+        '可在看板上「废弃该请求」，或在修好文件后重新物化',
+      )
     }
-    const planned = this.planAdditions(project, 'human', MAX_ADDITIONS_BATCHES)
-    if (planned === undefined) {
+    const files = this.actionableAdditions(project).slice(0, MAX_ADDITIONS_BATCHES)
+    const planned = this.planHumanAdditions(project, files)
+    if (planned.batches.length === 0 && planned.unplannable.length === 0) {
       // TOCTOU: the settle path consumed it between the badge and the click.
       this.refreshPendingAdditions(projectId)
       throw new TransitionError('the pending request was already consumed')
     }
-    const claimed = planned.batches.map(batch => ({ batch, path: this.claimAdditionsBatch(project, batch.file) }))
     const suffix = note === undefined || note.trim() === ''
       ? ''
       : `｜备注：${boundText(note, 200)}`
-    const reopenFrom: ProjectStatus | undefined = project.status === 'done' || project.status === 'blocked' ? project.status : undefined
-    const audit = `${additionsNote('人工物化新增任务请求', planned.pending, planned.skipped, reopenFrom)}${suffix}`
-    const reopened = this.reopenProjectForAdditions(project, audit)
+    // "Will this click put anything on the board?" gates BOTH the re-open and
+    // the wording: a batch that materializes zero leaves (every titlePath
+    // already exists, or an empty `tasks: []`) is consumed and audited, but
+    // re-opening a done project for it would strand the card in「执行中」with
+    // nothing running and no session left to settle it.
+    const willMaterialize = planned.pending.length > 0
+    const reopenFrom: ProjectStatus | undefined =
+      willMaterialize && (project.status === 'done' || project.status === 'blocked') ? project.status : undefined
+    const audit = [
+      additionsNote('人工物化新增任务请求', planned.pending, planned.skipped, reopenFrom),
+      planned.broken.length === 0 ? '' : `；保留 ${planned.broken.length} 个无法解析的请求（${planned.broken.map(entry => entry.file.ref.name).join('、')}）`,
+      planned.unplannable.length === 0 ? '' : `；隔离 ${planned.unplannable.length} 个无法物化的请求（${planned.unplannable.map(entry => entry.file.ref.name).join('、')}）`,
+    ].join('') + suffix
+    /** Isolate every batch the planner rejected; returns what actually moved. */
+    const quarantineAll = (): PendingAdditionProblem[] => {
+      const parked: PendingAdditionProblem[] = []
+      for (const entry of planned.unplannable) {
+        const name = this.quarantineAdditionsBatch(project, entry.file, entry.error)
+        if (name === undefined) continue
+        parked.push({ file: name, at: entry.file.mtimeMs, error: entry.error })
+      }
+      return parked
+    }
+    if (planned.batches.length === 0) {
+      // Every actionable batch is unplannable. A quarantine is NOT a
+      // materialization: the project must not be re-opened (a done project
+      // would be left executing with nothing running), but the decision is
+      // still audited. The throw is the receipt — a silent 200 with the badge
+      // gone would read as "the button did nothing".
+      this.noteProjectObservation(projectId, audit, 'human')
+      const parked = quarantineAll()
+      this.refreshPendingAdditions(projectId)
+      throw new TransitionError(
+        `${parked.length} 个待处理请求均无法物化，已隔离为 *.failed.json（详见项目历史的异常记录）；` +
+        `如需重试，请修好原因后把文件改回 ${TASK_ADDITIONS_FILE}`,
+      )
+    }
+    const claimed = planned.batches.map(batch => ({ batch, path: this.claimAdditionsBatch(project, batch.file) }))
+    const reopened = willMaterialize ? this.reopenProjectForAdditions(project, audit) : false
     this.commitMaterialized(project, planned.pending, 'human', reopened ? {} : { projectNote: audit })
     const consumed = claimed.map(entry => this.keepAdditionsBatchConsumed(project, entry.path, entry.batch.file.mtimeMs))
+    // Quarantine AFTER the ledger commit: the leaf batch is the valuable half,
+    // and a rename that fails must not roll back a committed materialization.
+    const failed = quarantineAll()
     // The badge must disappear with the click, not up to one tick later.
-    this.pendingAdditions.delete(projectId)
-    this.broadcast()
-    return { created: planned.pending, skipped: planned.skipped, consumed, reopened, project: this.requireProject(projectId) }
+    this.refreshPendingAdditions(projectId)
+    const broken: PendingAdditionProblem[] = planned.broken.map(entry => ({
+      file: entry.file.ref.name,
+      at: entry.file.mtimeMs,
+      error: entry.error,
+    }))
+    return {
+      created: planned.pending,
+      skipped: planned.skipped,
+      consumed,
+      failed,
+      broken,
+      reopened,
+      project: this.requireProject(projectId),
+    }
+  }
+
+  /**
+   * Human entry: throw the project's pending requests away instead of
+   * materializing them. This is the ONLY exit for a request that can never be
+   * materialized (a body the human will not fix, or work they no longer want):
+   * without it a broken file pins a permanent "⚠ 无法解析" badge on the board
+   * with nothing clickable next to it.
+   *
+   * Every actionable batch — fresh, ingested, claimed-but-unfinished, and
+   * broken bodies alike — is parked as `tasks-additions.<mtime>.discarded.json`
+   * and ONE `human` audit note names them. Nothing is deleted, no leaf, session
+   * or project status is touched: discarding a request must never re-open a
+   * `done` project, and a file parked this way is never consumed again.
+   */
+  discardPendingAdditions(projectId: string, note?: string): DiscardAdditionsResult {
+    const project = this.requireProject(projectId)
+    const files = this.actionableAdditions(project)
+    if (files.length === 0) {
+      throw new TransitionError(`project ${projectId} has no pending task-additions request to discard`)
+    }
+    const discarded: DiscardedAdditionsFile[] = []
+    for (const file of files) {
+      try {
+        const name = this.keepAdditionsBatch(project, file.path, file.mtimeMs, 'discarded')
+        discarded.push({ file: name, at: file.mtimeMs })
+      } catch {
+        // A concurrent consumer claimed it first; the next tick sees the truth.
+      }
+    }
+    if (discarded.length === 0) {
+      this.refreshPendingAdditions(projectId)
+      throw new TransitionError('the pending request was already consumed')
+    }
+    const suffix = note === undefined || note.trim() === ''
+      ? ''
+      : `｜备注：${boundText(note, 200)}`
+    const names = discarded.slice(0, 3).map(entry => entry.file).join('、')
+    const preview = discarded.length > 3 ? `${names} 等 ${discarded.length} 个批次` : names
+    this.noteProjectObservation(
+      projectId,
+      `人工废弃新增任务请求：${discarded.length} 个批次（${preview}）${suffix}`,
+      'human',
+    )
+    // The badge must disappear with the click, not up to one tick later.
+    this.refreshPendingAdditions(projectId)
+    return { discarded, project: this.requireProject(projectId) }
   }
 
   /**
@@ -1285,6 +1709,330 @@ export class KanbanHostService {
     project.sessionRole = undefined
     this.commit(project, actor, project.status, project.status, 'execution split into new task leaves')
     return this.requireProject(projectId)
+  }
+
+  // ── Archive (soft): a ledger marker plus a view, never a delete ───────────
+  //
+  // Archiving touches the ledger and the view ONLY. It never starts or cancels
+  // a session, never changes a status and never removes a file: `plan.md`,
+  // `artifacts/`, and the request audit files all stay exactly where they are.
+  // Records stay addressable by id (getProject / getTask / deleteProject /
+  // readProjectFile keep reading the raw ledger), so an archived record is
+  // hidden, not gone.
+
+  /**
+   * One sweep: pick the candidates from the RAW ledger, stamp them, then
+   * persist and broadcast once.
+   *
+   * Idempotent and side-effect free when nothing is due (no revision bump, no
+   * write, no broadcast), which is what makes a background sweep acceptable on
+   * a ledger that is rewritten in full on every mutation.
+   *
+   * @param now - the judgement instant (injectable so tests and the startup
+   *   catch-up are deterministic).
+   * @returns the ids actually archived by this sweep.
+   */
+  archiveSweep(now: number = Date.now()): { projects: string[]; tasks: string[] } {
+    const none = { projects: [] as string[], tasks: [] as string[] }
+    if (this.archiveAfterDays <= 0) return none
+
+    // Memory filters first: the single disk probe (a pending request) only runs
+    // for projects that are done, non-container, and already past the window.
+    const projectHits: Project[] = []
+    for (const project of this.state.projects) {
+      if (project.archivedAt !== undefined) continue
+      if (!archiveWindowReached(project, now, this.archiveAfterDays)) continue
+      if (this.projectArchiveBlock(project) !== undefined) continue
+      projectHits.push(project)
+    }
+
+    const leafHits: TaskNode[] = []
+    if (this.archiveDoneTaskLeaves) {
+      for (const task of this.state.tasks) {
+        if (task.archivedAt !== undefined) continue
+        if (task.status !== 'done') continue
+        if (!archiveWindowReached(task, now, this.archiveAfterDays)) continue
+        const parent = this.getProject(task.projectId)
+        // An orphan leaf is skipped rather than guessed at.
+        if (parent === undefined) continue
+        if (this.taskArchiveBlock(task, parent) !== undefined) continue
+        leafHits.push(task)
+      }
+    }
+
+    if (projectHits.length === 0 && leafHits.length === 0) return none
+    const changes: ArchiveChange[] = [
+      ...projectHits.map(project => ({ node: project, actor: 'system' as Actor, archive: true, note: autoArchiveNote(project, now, this.archiveAfterDays) })),
+      ...leafHits.map(task => ({ node: task, actor: 'system' as Actor, archive: true, note: autoArchiveNote(task, now, this.archiveAfterDays) })),
+    ]
+    if (!this.persistArchiveChanges(changes, now)) return none
+    console.warn(`[dsh-kanban] auto-archived ${projectHits.length} project(s) / ${leafHits.length} leaf(ves) after ${this.archiveAfterDays}d`)
+    return { projects: projectHits.map(project => project.id), tasks: leafHits.map(task => task.id) }
+  }
+
+  /**
+   * Why a project must NOT be archived, or undefined when it may.
+   *
+   * I1–I4 live here and only here, and the sweep and the human action share
+   * them: a function that let the button archive what the sweep refuses (or the
+   * other way round) would be two policies pretending to be one.
+   */
+  private projectArchiveBlock(project: Project): string | undefined {
+    if (project.status !== 'done') return '尚未完成，只能归档已完成的项目'
+    // I2: a long-running project is the board's container, not a work item.
+    // Its one-shot affiliated children ARE archivable (that is where finished
+    // sub-projects pile up).
+    if (project.lifecycle === 'long-running') return '长期执行项目是看板容器，不能归档'
+    // I3: a done project with open leaves is a contradiction the board reports;
+    // archiving it would hide the contradiction instead of surfacing it.
+    if (this.hasUnfinishedLeaves(project.id)) return '项目仍有未完成的子任务，不能归档'
+    // I4: a request that is still waiting for a human must never be hidden by
+    // an archive. Read from disk, never from the 5-second-old published cache.
+    if (this.hasActionableRequest(project)) return '项目存在待处理的新增任务请求，请先物化或废弃，再归档'
+    return undefined
+  }
+
+  /**
+   * Why a leaf must NOT be archived, or undefined when it may.
+   *
+   * A leaf is only ever archived on its own while its project is still on the
+   * board: once the project is archived (or done, i.e. about to be archived by
+   * the project rule) the leaf hides and returns with it, and a marker of its
+   * own would outlive the click that was supposed to bring everything back.
+   */
+  private taskArchiveBlock(task: TaskNode, project: Project): string | undefined {
+    if (task.status !== 'done') return '尚未完成，只能归档已完成的任务'
+    if (project.archivedAt !== undefined || project.status === 'done') {
+      return '项目已完成或已归档，其叶子随项目一起隐藏，无需单独归档'
+    }
+    return undefined
+  }
+
+  /** I4 probe: does the project still have a materializable request on disk? */
+  private hasActionableRequest(project: Project): boolean {
+    try {
+      return this.actionableAdditions(project).length > 0
+    } catch (error) {
+      // Conservative failure: an I/O error we cannot read means "assume there
+      // is a request" — skipping an archive costs one sweep, hiding a request
+      // costs the human the only door it has.
+      console.error(`[dsh-kanban] additions probe failed for ${project.id}; treating it as pending`, error)
+      return true
+    }
+  }
+
+  /**
+   * Human entry: archive one finished project. Idempotent — archiving an
+   * already-archived project is a no-op (no history, no version, no revision).
+   */
+  archiveProject(projectId: string, note?: string, actor: Actor = 'human'): Project {
+    const project = this.requireProject(projectId)
+    if (project.archivedAt !== undefined) return project
+    const block = this.projectArchiveBlock(project)
+    if (block !== undefined) throw new TransitionError(block)
+    const change: ArchiveChange = { node: project, actor, archive: true, note: manualArchiveNote(note) }
+    if (!this.persistArchiveChanges([change], Date.now())) {
+      throw new TransitionError('归档写入账本失败，请重试')
+    }
+    return this.requireProject(projectId)
+  }
+
+  /**
+   * Human entry: the exact inverse of archiveProject.
+   *
+   * Only the project's own marker is cleared. A leaf that had been archived
+   * individually BEFORE the project was archived keeps its marker, so the
+   * visible set after a restore is element-wise the visible set before the
+   * archive: restoring a project must not silently undo a separate decision
+   * about one of its leaves (that leaf has its own entry in the archive view).
+   * The project's other leaves come back with it, which is what makes the
+   * restore a single click.
+   */
+  unarchiveProject(projectId: string, note?: string, actor: Actor = 'human'): Project {
+    const project = this.requireProject(projectId)
+    if (project.archivedAt === undefined) return project
+    const change: ArchiveChange = { node: project, actor, archive: false, note: restoreNote(note) }
+    if (!this.persistArchiveChanges([change], Date.now())) {
+      throw new TransitionError('恢复归档写入账本失败，请重试')
+    }
+    return this.requireProject(projectId)
+  }
+
+  /** Human entry: archive one finished leaf of a still-visible project. */
+  archiveTask(projectId: string, taskId: string, note?: string, actor: Actor = 'human'): TaskNode {
+    const task = this.requireProjectTask(projectId, taskId)
+    const project = this.requireProject(projectId)
+    // Effective-hidden is the idempotence test, not "has its own marker": a
+    // leaf that is already hidden by its project is done being hidden, and
+    // stamping it now would change the board AFTER the project is restored —
+    // a choice the user could not see when they made it.
+    if (task.archivedAt !== undefined || project.archivedAt !== undefined) return task
+    const block = this.taskArchiveBlock(task, project)
+    if (block !== undefined) throw new TransitionError(block)
+    const change: ArchiveChange = { node: task, actor, archive: true, note: manualArchiveNote(note) }
+    if (!this.persistArchiveChanges([change], Date.now())) {
+      throw new TransitionError('归档写入账本失败，请重试')
+    }
+    return this.requireTask(taskId)
+  }
+
+  /**
+   * Human entry: the exact inverse of archiveTask. Clearing is always safe:
+   * it only revokes an earlier intent, and it is applied even while the owning
+   * project is archived (the effect shows up when the project returns).
+   */
+  unarchiveTask(projectId: string, taskId: string, note?: string, actor: Actor = 'human'): TaskNode {
+    const task = this.requireProjectTask(projectId, taskId)
+    if (task.archivedAt === undefined) return task
+    const change: ArchiveChange = { node: task, actor, archive: false, note: restoreNote(note) }
+    if (!this.persistArchiveChanges([change], Date.now())) {
+      throw new TransitionError('恢复归档写入账本失败，请重试')
+    }
+    return this.requireTask(taskId)
+  }
+
+  /**
+   * The archive read's projection: pure read of the raw ledger, no session, no
+   * file, no write. `history` is dropped on purpose — it is about half of the
+   * ledger by size and the archive list shows a title plus a few timestamps.
+   *
+   * @param projectId - narrow to one cluster: a visible project's own archived
+   *   leaves, the archived one-shot projects affiliated to it, and those
+   *   children's archived leaves (a dependency cluster must stay closed). The
+   *   project itself is never included — the caller is already rendering it.
+   */
+  archiveEntries(projectId?: string): ArchiveEntry[] {
+    const archivedProjects = archivedProjectIds(this.state.projects)
+    const entries: ArchiveEntry[] = []
+    const projectEntry = (project: Project): ArchiveEntry => {
+      const parent = project.parentId === undefined ? undefined : this.getProject(project.parentId)
+      return {
+        kind: 'project',
+        id: project.id,
+        title: project.title,
+        projectId: project.id,
+        archivedAt: project.archivedAt!,
+        ...(project.archivedBy === undefined ? {} : { archivedBy: project.archivedBy }),
+        ...(project.archiveNote === undefined ? {} : { archiveNote: project.archiveNote }),
+        ...(parent === undefined ? {} : { parentTitle: parent.title }),
+        status: project.status,
+        ...(project.lifecycle === undefined ? {} : { lifecycle: project.lifecycle }),
+        taskCount: this.state.tasks.filter(task => task.projectId === project.id).length,
+      }
+    }
+    const taskEntry = (task: TaskNode, owner: Project): ArchiveEntry => ({
+      kind: 'task',
+      id: task.id,
+      title: task.titlePath,
+      projectId: task.projectId,
+      archivedAt: task.archivedAt!,
+      ...(task.archivedBy === undefined ? {} : { archivedBy: task.archivedBy }),
+      ...(task.archiveNote === undefined ? {} : { archiveNote: task.archiveNote }),
+      titlePath: task.titlePath,
+      taskKind: task.kind,
+      status: task.status,
+      projectTitle: owner.title,
+    })
+
+    if (projectId === undefined) {
+      for (const project of this.state.projects) {
+        if (project.archivedAt !== undefined) entries.push(projectEntry(project))
+      }
+      // Leaves whose project is archived are implied by that project entry:
+      // listing them again would double count and offer a restore that has no
+      // visible effect.
+      for (const task of this.state.tasks) {
+        if (task.archivedAt === undefined) continue
+        if (archivedProjects.has(task.projectId)) continue
+        const owner = this.getProject(task.projectId)
+        if (owner === undefined) continue
+        entries.push(taskEntry(task, owner))
+      }
+      return entries
+    }
+
+    const children = this.state.projects.filter(project => project.parentId === projectId && project.archivedAt !== undefined)
+    const childIds = new Set(children.map(child => child.id))
+    const owner = this.getProject(projectId)
+    for (const task of this.state.tasks) {
+      if (task.archivedAt === undefined) continue
+      if (task.projectId === projectId) {
+        if (owner !== undefined) entries.push(taskEntry(task, owner))
+        continue
+      }
+      if (!childIds.has(task.projectId)) continue
+      const child = this.getProject(task.projectId)
+      if (child !== undefined) entries.push(taskEntry(task, child))
+    }
+    for (const child of children) entries.push(projectEntry(child))
+    return entries
+  }
+
+  /**
+   * Write one archive batch: stamp/clear the markers, add one metadata history
+   * entry per record, persist and broadcast once.
+   *
+   * A failed write rolls the in-memory ledger back to exactly its previous
+   * shape (I16): the disk still holds the old ledger, and without the rollback
+   * the next sweep would skip these records forever — a "ghost archive" that
+   * exists only in memory and can never be persisted.
+   *
+   * @returns whether the batch reached the disk.
+   */
+  private persistArchiveChanges(changes: readonly ArchiveChange[], now: number): boolean {
+    if (changes.length === 0) return false
+    const revision = this.state.revision
+    const undo: ArchiveUndo[] = []
+    for (const change of changes) {
+      const node = change.node
+      undo.push({
+        node,
+        archivedAt: node.archivedAt,
+        archivedBy: node.archivedBy,
+        archiveNote: node.archiveNote,
+        version: node.version,
+        updatedAt: node.updatedAt,
+        lastActivityAt: node.lastActivityAt,
+        historyLength: node.history.length,
+      })
+      if (change.archive) {
+        node.archivedAt = now
+        node.archivedBy = change.actor
+        node.archiveNote = change.note
+      } else {
+        delete node.archivedAt
+        delete node.archivedBy
+        delete node.archiveNote
+      }
+      node.updatedAt = now
+      node.lastActivityAt = now
+      node.version += 1
+      const from = node.status
+      // Metadata commit: from === to === 'done', so no state-machine edge is
+      // involved and no dependency scheduling is triggered (I10).
+      node.history.push({ at: now, actor: change.actor, from, to: from, note: change.note })
+    }
+    try {
+      this.mutate()
+      return true
+    } catch (error) {
+      for (const entry of undo) {
+        const node = entry.node
+        if (entry.archivedAt === undefined) delete node.archivedAt
+        else node.archivedAt = entry.archivedAt
+        if (entry.archivedBy === undefined) delete node.archivedBy
+        else node.archivedBy = entry.archivedBy
+        if (entry.archiveNote === undefined) delete node.archiveNote
+        else node.archiveNote = entry.archiveNote
+        node.version = entry.version
+        node.updatedAt = entry.updatedAt
+        node.lastActivityAt = entry.lastActivityAt
+        node.history.length = entry.historyLength
+      }
+      this.state.revision = revision
+      console.error('[dsh-kanban] archive persist failed; rolled back in memory', error)
+      return false
+    }
   }
 
   /** A decomposed project completes when every leaf is done (system derivation). */
@@ -1344,6 +2092,77 @@ export function initialTaskStatus(kind: TaskKind): ProjectStatus {
   }
 }
 
+/**
+ * Whether the archive window of a finished record has elapsed.
+ *
+ * `updatedAt` is the ledger's last-commit time, so a fresh commit (including a
+ * restore) always buys a full window — that is what stops a restored record
+ * from being re-archived by the next tick.
+ *
+ * `afterDays <= 0` means "automatic archiving is OFF", never "archive
+ * everything now": without the short circuit the comparison would be true for
+ * every record and a `0` window would empty the finished column at boot.
+ * The boundary itself counts as reached (`now - updatedAt === afterDays`).
+ */
+export function archiveWindowReached(node: { updatedAt: number }, now: number, afterDays: number): boolean {
+  if (afterDays <= 0) return false
+  return now - node.updatedAt >= afterDays * MS_PER_DAY
+}
+
+/** One node's batch commit, before it is written. */
+interface BatchEntry {
+  node: Project | TaskNode
+  actor: Actor
+  from: ProjectStatus
+  to: ProjectStatus
+  note?: string
+}
+
+/** One archive/unarchive change, before it is written. */
+interface ArchiveChange {
+  node: Project | TaskNode
+  actor: Actor
+  /** true stamps the marker, false clears it. */
+  archive: boolean
+  /** The `archiveNote` and the history note of this change (one text, two uses). */
+  note: string
+}
+
+/** Everything a failed archive write has to put back, per record plus the ledger revision. */
+interface ArchiveUndo {
+  node: Project | TaskNode
+  archivedAt: number | undefined
+  archivedBy: Actor | undefined
+  archiveNote: string | undefined
+  version: number
+  updatedAt: number
+  lastActivityAt: number
+  historyLength: number
+}
+
+/** Narrow a ledger record to a task leaf (the two shapes share the commit path). */
+function isTaskNode(node: Project | TaskNode): node is TaskNode {
+  return 'titlePath' in node
+}
+
+/** The audit text of an automatic archive: readable, bounded, and the reason for the marker. */
+function autoArchiveNote(node: { updatedAt: number }, now: number, afterDays: number): string {
+  const ageDays = Math.floor(Math.max(0, now - node.updatedAt) / MS_PER_DAY)
+  return boundText(`自动归档：已完成 ${ageDays} 天（阈值 ${afterDays} 天）`, ARCHIVE_NOTE_MAX)
+}
+
+/** The audit text of a manual archive (an empty note is "not provided"). */
+function manualArchiveNote(note: string | undefined): string {
+  const trimmed = note === undefined ? '' : note.trim()
+  return trimmed === '' ? '手动归档' : boundText(`手动归档｜${trimmed}`, ARCHIVE_NOTE_MAX)
+}
+
+/** The audit text of a restore; it lives in the history only (`archiveNote` is cleared). */
+function restoreNote(note: string | undefined): string {
+  const trimmed = note === undefined ? '' : note.trim()
+  return trimmed === '' ? '恢复归档' : boundText(`恢复归档｜${trimmed}`, ARCHIVE_NOTE_MAX)
+}
+
 /** Collapse whitespace and bound a string for the hot snapshot frame. */
 function boundText(text: string, max: number): string {
   const collapsed = text.replace(/\s+/g, ' ').trim()
@@ -1360,6 +2179,7 @@ function toPendingAddition(projectId: string, probe: AdditionsProbe): PendingAdd
     batches: probe.batches,
     count: probe.count,
     ...(probe.state === 'malformed' ? {} : { items: probe.items }),
+    ...(probe.malformed.length === 0 ? {} : { malformed: probe.malformed }),
     ...(probe.error === undefined ? {} : { error: probe.error }),
   }
 }
@@ -1377,7 +2197,14 @@ function samePendingAddition(left: PendingAddition | undefined, right: PendingAd
   const leftItems = left.items ?? []
   const rightItems = right.items ?? []
   if (leftItems.length !== rightItems.length) return false
-  return leftItems.every((item, index) => item.titlePath === rightItems[index]!.titlePath && item.kind === rightItems[index]!.kind)
+  if (!leftItems.every((item, index) => item.titlePath === rightItems[index]!.titlePath && item.kind === rightItems[index]!.kind)) return false
+  const leftMalformed = left.malformed ?? []
+  const rightMalformed = right.malformed ?? []
+  if (leftMalformed.length !== rightMalformed.length) return false
+  return leftMalformed.every((problem, index) => {
+    const other = rightMalformed[index]!
+    return problem.file === other.file && problem.at === other.at && problem.error === other.error
+  })
 }
 
 /**

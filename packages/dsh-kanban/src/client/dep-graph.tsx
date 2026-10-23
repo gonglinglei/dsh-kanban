@@ -69,6 +69,11 @@ export function DependencyGraph({ tasks, onOpenTaskDetail }: DependencyGraphProp
           const classNames = ['dk-graph-node']
           if (task.status === 'blocked') classNames.push('dk-graph-node-blocked')
           if (task.status === 'done') classNames.push('dk-graph-node-done')
+          // An archived leaf reaches this graph through the project detail's
+          // compensation read (it is filtered out of the snapshot). It is kept
+          // in the layout so the edge to it is drawn, but it must read as "no
+          // longer on the board" rather than as ordinary active work.
+          if (task.archivedAt !== undefined) classNames.push('dk-graph-node-archived')
           return (
             <div
               key={node.id}

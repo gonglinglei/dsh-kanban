@@ -5,8 +5,17 @@
  * GUI; colors ride the dsh --dsw-* tokens with neutral fallbacks.
  */
 export const BOARD_CSS = `
+/* The view fills the center column from NORMAL FLOW. It must never be
+   absolutely positioned: the shell's column is a static CSS-grid/flex item
+   (verified against the 0.2.0 Desktop shell, where .centerCol — hashed to
+   _6Qf49G_centerCol — carries no position), so \`position: absolute; inset: 0\`
+   would resolve against the positioned .frame and the board would cover the
+   whole frame INCLUDING the sidebar track. \`height: 100%\` fills grid/block
+   columns; \`flex: 1 1 0\` fills the flex column today's shell uses. The
+   sibling-hiding rule below leaves this the only in-flow child while open. */
 [data-dsh-kanban-view] {
-  position: absolute; inset: 0; display: none; z-index: 60;
+  display: none; height: 100%; flex: 1 1 0; box-sizing: border-box;
+  min-height: 0; min-width: 0;
   background: var(--dsw-alias-bg-base, #ffffff); overflow: hidden;
 }
 html[data-dsh-kanban-active] [data-dsh-kanban-view] { display: block; }
@@ -157,6 +166,17 @@ html[data-dsh-kanban-active] [class*='centerCol'] > :not([data-dsh-kanban-view])
 [data-dsh-kanban-view] .dk-detail-history-actor { font-weight: 600; }
 [data-dsh-kanban-view] .dk-detail-history-note { color: var(--dsw-alias-text-secondary, #666); word-break: break-all; }
 
+/* Archive view (header「归档 (N)」→ list of hidden records). The grey left bar
+   is the visual language for "this is not on the board right now". */
+[data-dsh-kanban-view] .dk-archive-summary { margin-bottom: 4px; }
+[data-dsh-kanban-view] .dk-archive-row {
+  border-left: 3px solid var(--dsw-alias-border-strong, #b0b0b0);
+  background: var(--dsw-alias-bg-subtle, #f4f5f7);
+}
+[data-dsh-kanban-view] .dk-archive-time {
+  color: var(--dsw-alias-text-tertiary, #999); font-variant-numeric: tabular-nums;
+}
+
 /* Sub-task dependency graph (project detail「列表 / 依赖图」switch). */
 [data-dsh-kanban-view] .dk-detail-heading-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 [data-dsh-kanban-view] .dk-view-toggle { display: flex; gap: 4px; }
@@ -180,6 +200,9 @@ html[data-dsh-kanban-active] [class*='centerCol'] > :not([data-dsh-kanban-view])
 [data-dsh-kanban-view] .dk-graph-node:hover { border-color: var(--dsw-alias-border-strong, #999); }
 [data-dsh-kanban-view] .dk-graph-node-blocked { border-left: 3px solid #b3261e; }
 [data-dsh-kanban-view] .dk-graph-node-done { opacity: 0.6; }
+/* An archived provider pulled back by the project detail's compensation read:
+   drawn (so the dependency edge survives) but marked as off-board. */
+[data-dsh-kanban-view] .dk-graph-node-archived { border-style: dashed; background: var(--dsw-alias-bg-subtle, #f4f5f7); }
 [data-dsh-kanban-view] .dk-graph-node-title {
   font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }

@@ -20,13 +20,22 @@ export const BOARD_VIEW_SELECTOR = '[data-dsh-kanban-view]'
 
 const CONVERSATION_COLUMN_SELECTOR = '[data-pane="conversation"], [class*="centerCol"]'
 
-/** One <style data-plugin> tag with the board's rules (idempotent). */
+/** One <style data-plugin> tag with the board's rules.
+ *
+ *  Updated in place when the tag already exists with different text: an
+ *  injected stylesheet outlives the fiber that injected it, so skip-if-present
+ *  would keep the previous build's rules applied for the rest of the page's
+ *  life — including across the client bundle hot-reload that ships them. */
 function injectBoardCss(): void {
-  const tagId = 'dsh-kanban/board.css'
-  if (document.querySelector('style[data-plugin-css="dsh-kanban/board.css"]') !== null) return
+  const selector = 'style[data-plugin-css="dsh-kanban/board.css"]'
+  const existing = document.querySelector<HTMLStyleElement>(selector)
+  if (existing !== null) {
+    if (existing.textContent !== BOARD_CSS) existing.textContent = BOARD_CSS
+    return
+  }
   const tag = document.createElement('style')
   tag.dataset.plugin = 'dsh-kanban'
-  tag.dataset.pluginCss = tagId
+  tag.dataset.pluginCss = 'dsh-kanban/board.css'
   tag.textContent = BOARD_CSS
   document.head.appendChild(tag)
 }

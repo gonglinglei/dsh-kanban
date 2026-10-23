@@ -4,7 +4,10 @@
  * fallback. Mirrors the dsh-web-ui task-board HttpTaskBoardHostTransport
  * pattern (Apache-2.0).
  */
-import { KANBAN_API_PREFIX, type KanbanAction, type KanbanActionEnvelope, type KanbanEventPayload, type KanbanSnapshot } from '../protocol.ts'
+import {
+  KANBAN_API_PREFIX,
+  type ArchiveEntry, type KanbanAction, type KanbanActionEnvelope, type KanbanEventPayload, type KanbanSnapshot,
+} from '../protocol.ts'
 
 const REQUEST_TIMEOUT_MS = 15_000
 
@@ -13,6 +16,15 @@ export interface KanbanHostTransport {
   action(action: KanbanAction): Promise<KanbanSnapshot>
   /** Read one project artifact (plan.md preview); kept out of the snapshot on purpose. */
   file(path: string): Promise<string>
+  /**
+   * Read the archived records. On-demand like file(): the archive is
+   * deliberately absent from the hot snapshot (a host that declares
+   * CAPABILITY_TASK_ARCHIVE serves it at GET /kanban/archive).
+   * @param projectId - narrow to one project's cluster (used by a display page
+   *   that must pull back archived siblings for a complete dependency graph).
+   *   `undefined` means "no filter"; never pass `''` (the route rejects blank).
+   */
+  archive(projectId?: string): Promise<ArchiveEntry[]>
   subscribe(listener: (payload?: KanbanEventPayload) => void): () => void
 }
 
@@ -59,6 +71,15 @@ export class HttpKanbanHostTransport implements KanbanHostTransport {
       { cache: 'no-store' },
     )
     return body.content
+  }
+
+  async archive(projectId?: string): Promise<ArchiveEntry[]> {
+    const query = projectId === undefined ? '' : `?projectId=${encodeURIComponent(projectId)}`
+    const body = await this.request<{ ok: boolean; archive: ArchiveEntry[] }>(
+      `${KANBAN_API_PREFIX}/archive${query}`,
+      { cache: 'no-store' },
+    )
+    return body.archive
   }
 
   private async request<T>(url: string, init: RequestInit): Promise<T> {

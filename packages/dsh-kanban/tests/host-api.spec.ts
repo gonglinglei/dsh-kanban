@@ -77,3 +77,58 @@ describe('HttpKanbanHostTransport.file()', () => {
     )
   })
 })
+
+describe('HttpKanbanHostTransport.archive()', () => {
+  /** One archived project entry as the host's projection serves it. */
+  const entry = {
+    kind: 'project' as const,
+    id: 'p1',
+    title: '代码开源审查',
+    projectId: 'p1',
+    archivedAt: 1_789_000_000_000,
+    archivedBy: 'system' as const,
+    archiveNote: 'auto: done for 7d',
+    status: 'done' as const,
+    taskCount: 3,
+  }
+
+  it('requests the unfiltered route with NO query string when no project is given', async () => {
+    stubFetch(new Response(JSON.stringify({ ok: true, archive: [] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }))
+    const transport = new HttpKanbanHostTransport()
+
+    await expect(transport.archive()).resolves.toEqual([])
+    // No bare `?`: the route treats a blank `projectId` as malformed, so the
+    // client must omit the parameter entirely rather than send it empty.
+    expect(fetch).toHaveBeenCalledWith(
+      `${KANBAN_API_PREFIX}/archive`,
+      expect.objectContaining({ cache: 'no-store' }),
+    )
+  })
+
+  it('narrows to one cluster and encodes the project id', async () => {
+    stubFetch(new Response(JSON.stringify({ ok: true, archive: [entry] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }))
+    const transport = new HttpKanbanHostTransport()
+
+    await expect(transport.archive('p 1')).resolves.toEqual([entry])
+    expect(fetch).toHaveBeenCalledWith(
+      `${KANBAN_API_PREFIX}/archive?projectId=${encodeURIComponent('p 1')}`,
+      expect.objectContaining({ cache: 'no-store' }),
+    )
+  })
+
+  it('surfaces the host-provided error message on a non-2xx answer', async () => {
+    stubFetch(new Response(JSON.stringify({ ok: false, error: 'forbidden' }), {
+      status: 403,
+      headers: { 'content-type': 'application/json' },
+    }))
+    const transport = new HttpKanbanHostTransport()
+
+    await expect(transport.archive()).rejects.toThrow('forbidden')
+  })
+})
